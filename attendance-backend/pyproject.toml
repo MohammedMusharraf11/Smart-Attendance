@@ -1,0 +1,16 @@
+[project]
+name = "attendance-backend"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastapi>=0.141.1",
+    "insightface>=1.0.1",
+    "numpy>=2.5.2",
+    "onnxruntime>=1.29.0",
+    "opencv-python-headless>=5.0.0.93",
+    "pillow>=12.3.0",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.52.4",
+]
