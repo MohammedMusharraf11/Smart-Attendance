@@ -32,3 +32,26 @@ def mark_attendance(code: str, name: str, similarity: float) -> str:
     conn.commit()
     conn.close()
     return ts
+
+
+def get_recent_attendance(limit: int = 50):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, code, name, similarity, timestamp FROM attendance ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {
+            "id": row["id"],
+            "code": row["code"],
+            "name": row["name"],
+            "similarity": row["similarity"],
+            "timestamp": row["timestamp"],
+        }
+        for row in rows
+    ]
+

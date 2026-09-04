@@ -4,9 +4,10 @@ import io
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
-from app.attendance_log import init_db, mark_attendance
+from app.attendance_log import init_db, mark_attendance, get_recent_attendance
 from app.db import delete_student, enroll_embedding, list_students, query_best_match
 from app.model import get_embedding, get_model
 from app.qr import decode_qr
@@ -14,6 +15,14 @@ from app.qr import decode_qr
 MATCH_THRESHOLD = 0.40  # cosine similarity — tune after real-world testing
 
 app = FastAPI(title="Smart Attendance Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -132,3 +141,10 @@ async def mark_attendance_endpoint(qr_code: str = Form(...), image: UploadFile =
         "similarity": round(float(score), 4) if face_code else 0.0,
         "reason": "mismatch or below confidence threshold",
     }
+
+
+@app.get("/attendance/recent")
+def get_recent_attendance_records(limit: int = 50):
+    """List recent attendance logs from SQLite."""
+    return {"records": get_recent_attendance(limit=limit)}
+
