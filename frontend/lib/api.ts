@@ -47,6 +47,15 @@ export type LatestResult = Partial<MarkAttendanceResult> & {
   available: boolean
 }
 
+export type DeviceState = {
+  state: 'idle' | 'scan_qr' | 'blink' | 'processing' | 'result_ok' | 'result_fail'
+  detail: string
+  timestamp: number
+  student_name?: string | null
+  student_code?: string | null
+  similarity?: number | null
+}
+
 const baseUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, '') || 'http://127.0.0.1:8000'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -154,6 +163,19 @@ export const api = {
   triggerStatus: () => request<TriggerStatus>('/trigger-status'),
 
   latestResult: () => request<LatestResult>('/latest-result'),
+
+  getDeviceState: () => request<DeviceState>('/device-state'),
+
+  triggerDevice: () =>
+    request<{ status: string }>('/device/trigger', {
+      method: 'POST',
+    }),
+
+  getDeviceWsUrl: () => {
+    const wsProto = baseUrl.startsWith('https') ? 'wss:' : 'ws:'
+    const host = baseUrl.replace(/^https?:\/\//, '')
+    return `${wsProto}//${host}/ws/device-state`
+  },
 }
 
 export { baseUrl }

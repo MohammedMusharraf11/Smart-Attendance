@@ -10,6 +10,7 @@ import {
   type QRDecodeResult,
   type TriggerStatus,
   type LatestResult,
+  type DeviceState,
 } from '@/lib/api'
 import {
   AlertCircle,
@@ -1084,6 +1085,247 @@ function Esp32TriggerBridge({
 }
 
 /* =========================================================================
+   HARDWARE DEVICE CONTROLLER LIVE STATUS (ESP32 Serial + Liveness Feed)
+   ========================================================================= */
+function HardwareDeviceLiveCard({
+  onRecordAdded,
+  onError,
+  onSuccess,
+}: {
+  onRecordAdded: (r: AttendanceRecord) => void
+  onError: (msg: string) => void
+  onSuccess?: (msg: string) => void
+}) {
+  const [deviceState, setDeviceState] = useState<DeviceState>({
+    state: 'idle',
+    detail: 'Waiting for student to approach ESP32 ultrasonic sensor...',
+    timestamp: Date.now() / 1000,
+  })
+  const [wsConnected, setWsConnected] = useState(false)
+  const [triggering, setTriggering] = useState(false)
+  const lastRecordedTimestamp = useRef<number>(0)
+
+  useEffect(() => {
+    let ws: WebSocket | null = null
+    let pollInterval: any = null
+    let isMounted = true
+
+    const connectWebSocket = () => {
+      try {
+        const url = api.getDeviceWsUrl()
+        ws = new WebSocket(url)
+
+        ws.onopen = () => {
+          if (isMounted) setWsConnected(true)
+        }
+
+        ws.onmessage = (event) => {
+          try {
+            const data: DeviceState = JSON.parse(event.data)
+            if (isMounted) {
+              setDeviceState(data)
+              if (
+                data.state === 'result_ok' &&
+                data.student_name &&
+                data.student_code &&
+                data.timestamp !== lastRecordedTimestamp.current
+              ) {
+                lastRecordedTimestamp.current = data.timestamp
+                onRecordAdded({
+                  name: data.student_name,
+                  code: data.student_code,
+                  similarity: data.similarity || 1.0,
+                  timestamp: new Date(data.timestamp * 1000).toISOString(),
+                })
+                onSuccess?.(`Attendance verified for ${data.student_name} (${data.student_code})!`)
+              }
+            }
+          } catch {}
+        }
+
+        ws.onclose = () => {
+          if (isMounted) setWsConnected(false)
+          setTimeout(() => {
+            if (isMounted) connectWebSocket()
+          }, 2000)
+        }
+
+        ws.onerror = () => {
+          if (isMounted) setWsConnected(false)
+        }
+      } catch {
+        if (isMounted) setWsConnected(false)
+      }
+    }
+
+    connectWebSocket()
+
+    pollInterval = setInterval(async () => {
+      if (!wsConnected) {
+        try {
+          const st = await api.getDeviceState()
+          if (isMounted) {
+            setDeviceState(st)
+            if (
+              st.state === 'result_ok' &&
+              st.student_name &&
+              st.student_code &&
+              st.timestamp !== lastRecordedTimestamp.current
+            ) {
+              lastRecordedTimestamp.current = st.timestamp
+              onRecordAdded({
+                name: st.student_name,
+                code: st.student_code,
+                similarity: st.similarity || 1.0,
+                timestamp: new Date(st.timestamp * 1000).toISOString(),
+              })
+              onSuccess?.(`Attendance verified for ${st.student_name} (${st.student_code})!`)
+            }
+          }
+        } catch {}
+      }
+    }, 2000)
+
+    return () => {
+      isMounted = false
+      if (ws) ws.close()
+      if (pollInterval) clearInterval(pollInterval)
+    }
+  }, [onRecordAdded, onSuccess, wsConnected])
+
+  const handleManualTrigger = async () => {
+    setTriggering(true)
+    try {
+      await api.triggerDevice()
+      onSuccess?.('ESP32 Proximity Trigger simulated! Hardware cycle started.')
+    } catch (e: any) {
+      onError(e.message || 'Failed to trigger device cycle')
+    } finally {
+      setTriggering(false)
+    }
+  }
+
+  const stateConfig = {
+    idle: {
+      label: 'Idle — waiting for someone to approach',
+      desc: 'ESP32 ultrasonic proximity sensor is active. Come within 30cm of the sensor.',
+      badge: 'Listening (Ultrasonic)',
+      badgeColor: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30',
+      icon: Radio,
+      containerBg: 'border-border bg-card/70 shadow-sm',
+      pulse: false,
+    },
+    scan_qr: {
+      label: 'Scanning QR code...',
+      desc: 'Webcam active. Position student ID card QR code in front of camera.',
+      badge: 'Step 1/3: QR Scan',
+      badgeColor: 'bg-amber-500/20 text-amber-600 dark:text-amber-400 border-amber-500/40 animate-pulse',
+      icon: QrCode,
+      containerBg: 'border-amber-500/50 bg-amber-500/5 ring-1 ring-amber-500/20 shadow-md',
+      pulse: true,
+    },
+    blink: {
+      label: 'Checking liveness — please blink',
+      desc: 'MediaPipe FaceMesh is tracking Eye Aspect Ratio (EAR). Blink naturally at the camera.',
+      badge: 'Step 2/3: Liveness Check',
+      badgeColor: 'bg-sky-500/20 text-sky-600 dark:text-sky-400 border-sky-500/40 animate-pulse',
+      icon: Eye,
+      containerBg: 'border-sky-500/50 bg-sky-500/5 ring-1 ring-sky-500/20 shadow-md',
+      pulse: true,
+    },
+    processing: {
+      label: 'Verifying...',
+      desc: 'Extracting ArcFace 512-d embedding & querying ChromaDB for identity match.',
+      badge: 'Step 3/3: Biometric Match',
+      badgeColor: 'bg-indigo-500/20 text-indigo-600 dark:text-indigo-400 border-indigo-500/40 animate-pulse',
+      icon: RefreshCw,
+      containerBg: 'border-indigo-500/50 bg-indigo-500/5 ring-1 ring-indigo-500/20 shadow-md',
+      pulse: true,
+    },
+    result_ok: {
+      label: `✅ Marked: ${deviceState.student_name || 'Student'}`,
+      desc: `ID: ${deviceState.student_code || '—'} • ${
+        deviceState.similarity ? `${(deviceState.similarity * 100).toFixed(1)}% match` : 'Matched'
+      } • ESP32 green LED signaled.`,
+      badge: 'Attendance Verified',
+      badgeColor: 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border-emerald-500/40',
+      icon: CheckCircle2,
+      containerBg: 'border-emerald-500/60 bg-emerald-500/10 ring-2 ring-emerald-500/20 shadow-lg',
+      pulse: false,
+    },
+    result_fail: {
+      label: `❌ Not verified: ${deviceState.detail}`,
+      desc: 'ESP32 red LED & buzzer error tone signaled. Cycle restarting shortly.',
+      badge: 'Verification Failed',
+      badgeColor: 'bg-rose-500/20 text-rose-600 dark:text-rose-400 border-rose-500/40',
+      icon: XCircle,
+      containerBg: 'border-rose-500/60 bg-rose-500/10 ring-2 ring-rose-500/20 shadow-lg',
+      pulse: false,
+    },
+  }
+
+  const currentConfig = stateConfig[deviceState.state] || stateConfig.idle
+  const StatusIcon = currentConfig.icon
+
+  return (
+    <div className={`rounded-2xl border p-5 transition-all duration-300 ${currentConfig.containerBg}`}>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="flex items-start sm:items-center gap-3.5">
+          <div
+            className={`flex size-12 shrink-0 items-center justify-center rounded-xl transition-all ${
+              currentConfig.pulse
+                ? 'bg-amber-500 text-black shadow-md shadow-amber-500/40 animate-pulse'
+                : deviceState.state === 'result_ok'
+                ? 'bg-emerald-500 text-white shadow-md shadow-emerald-500/30'
+                : deviceState.state === 'result_fail'
+                ? 'bg-rose-500 text-white shadow-md shadow-rose-500/30'
+                : 'bg-muted text-muted-foreground'
+            }`}
+          >
+            <StatusIcon className={`size-6 ${deviceState.state === 'processing' ? 'animate-spin' : ''}`} />
+          </div>
+
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-base font-bold tracking-tight text-foreground">{currentConfig.label}</h3>
+              <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${currentConfig.badgeColor}`}>
+                <span className={`size-1.5 rounded-full ${currentConfig.pulse ? 'bg-amber-500 animate-ping' : 'bg-current'}`} />
+                {currentConfig.badge}
+              </span>
+              <span
+                className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full font-medium border ${
+                  wsConnected
+                    ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
+                    : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30'
+                }`}
+                title={wsConnected ? 'WebSocket live streaming active' : 'WebSocket disconnected, using polling'}
+              >
+                <span className={`size-1 rounded-full ${wsConnected ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+                {wsConnected ? 'WS Live' : 'Polling'}
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">{currentConfig.desc}</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 self-end sm:self-center">
+          <button
+            type="button"
+            onClick={handleManualTrigger}
+            disabled={triggering || deviceState.state !== 'idle'}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-border bg-background/80 hover:bg-muted px-3.5 py-2 text-xs font-semibold text-foreground shadow-sm transition-all disabled:opacity-50 cursor-pointer"
+            title="Simulate someone approaching the ESP32 sensor to demonstrate the live flow"
+          >
+            <Cpu className="size-3.5 text-amber-500" />
+            {triggering ? 'Triggering...' : 'Simulate Approach'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* =========================================================================
    2. LIVE ATTENDANCE STATION (Camera + QR + Face Verification + Real-time Feed)
    ========================================================================= */
 function LiveAttendanceSection({
@@ -1259,7 +1501,14 @@ function LiveAttendanceSection({
         </div>
       </div>
 
-      {/* ESP32 Hardware Trigger Bridge & Manual Upload Test Mode */}
+      {/* Real-time Hardware Device Controller Status Card */}
+      <HardwareDeviceLiveCard
+        onRecordAdded={onRecordAdded}
+        onError={onError}
+        onSuccess={onSuccess}
+      />
+
+      {/* ESP32 Hardware Trigger Bridge & Single-Image Auto Capture */}
       <Esp32TriggerBridge
         onRecordAdded={onRecordAdded}
         onError={onError}

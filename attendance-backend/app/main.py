@@ -1,15 +1,16 @@
-"""Smart attendance backend — enroll, infer, QR decode, and mark attendance."""
+import asyncio
 import io
 import time
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 from app.attendance_log import init_db, mark_attendance, get_recent_attendance
 from app.db import delete_student, enroll_embedding, list_students, query_best_match
+from app.device_controller import device_controller
 from app.model import get_embedding, get_model
 from app.qr import decode_qr
 
@@ -34,6 +35,17 @@ app.add_middleware(
 def startup():
     get_model()  # warm up so the first real request isn't slow
     init_db()
+    try:
+        loop = asyncio.get_running_loop()
+        device_controller.set_async_loop(loop)
+    except Exception:
+        pass
+    device_controller.start()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    device_controller.stop()
 
 
 def read_upload_to_bgr(file_bytes: bytes) -> np.ndarray:
@@ -73,6 +85,38 @@ def get_trigger_status():
 def get_latest_result():
     """Polled by ESP32 to receive the latest attendance verification outcome."""
     return latest_result
+
+
+@app.get("/device-state")
+def get_device_state():
+    """Returns the current state of the hardware device controller."""
+    return device_controller.current_state
+
+
+@app.post("/device/trigger")
+def trigger_device_cycle():
+    """Programmatically triggers an attendance verification cycle on the device controller."""
+    device_controller.trigger_cycle_now()
+    return {"status": "triggered"}
+
+
+@app.websocket("/ws/device-state")
+async def websocket_device_state(websocket: WebSocket):
+    """Real-time WebSocket streaming device state updates to the frontend dashboard."""
+    await websocket.accept()
+    # Send current state upon connecting
+    await websocket.send_json(device_controller.current_state)
+    device_controller.register_ws(websocket)
+    try:
+        while True:
+            # Keep connection open; can receive pings from client
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        device_controller.unregister_ws(websocket)
 
 
 @app.post("/enroll")

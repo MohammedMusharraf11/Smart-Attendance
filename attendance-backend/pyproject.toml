@@ -13,4 +13,6 @@ dependencies = [
     "pillow>=12.3.0",
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.52.4",
+    "pyserial>=3.5",
+    "mediapipe>=0.10.14",
 ]
