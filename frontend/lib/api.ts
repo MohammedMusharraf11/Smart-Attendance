@@ -38,6 +38,15 @@ export type HealthStatus = {
   status: string
 }
 
+export type TriggerStatus = {
+  active: boolean
+  triggered_at: number | null
+}
+
+export type LatestResult = Partial<MarkAttendanceResult> & {
+  available: boolean
+}
+
 const baseUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, '') || 'http://127.0.0.1:8000'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -113,6 +122,16 @@ export const api = {
     })
   },
 
+  markAttendanceSingle: async (imageFile: File | Blob) => {
+    const form = new FormData()
+    form.append('image', imageFile, 'capture.jpg')
+
+    return request<MarkAttendanceResult>('/mark-attendance-single', {
+      method: 'POST',
+      body: form,
+    })
+  },
+
   recent: async (limit = 50): Promise<AttendanceRecord[]> => {
     try {
       const data = await request<{ records: AttendanceRecord[] }>(`/attendance/recent?limit=${limit}`)
@@ -121,6 +140,20 @@ export const api = {
       return []
     }
   },
+
+  trigger: () =>
+    request<{ status: string }>('/trigger', {
+      method: 'POST',
+    }),
+
+  triggerReset: () =>
+    request<{ status: string }>('/trigger/reset', {
+      method: 'POST',
+    }),
+
+  triggerStatus: () => request<TriggerStatus>('/trigger-status'),
+
+  latestResult: () => request<LatestResult>('/latest-result'),
 }
 
 export { baseUrl }

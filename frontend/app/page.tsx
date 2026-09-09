@@ -8,6 +8,8 @@ import {
   type MarkAttendanceResult,
   type InferResult,
   type QRDecodeResult,
+  type TriggerStatus,
+  type LatestResult,
 } from '@/lib/api'
 import {
   AlertCircle,
@@ -16,6 +18,7 @@ import {
   CheckCircle2,
   ChevronRight,
   ClipboardList,
+  Cpu,
   Eye,
   FileCheck2,
   GraduationCap,
@@ -41,6 +44,7 @@ import {
   VideoOff,
   X,
   XCircle,
+  Zap,
 } from 'lucide-react'
 
 type Section = 'overview' | 'live-attendance' | 'enroll' | 'students' | 'tester' | 'history'
@@ -265,6 +269,7 @@ export default function SmartAttendanceDashboard() {
                 showToast(`Attendance verified for ${record.name} (${record.code})`, 'success')
               }}
               onError={(err) => showToast(err, 'error')}
+              onSuccess={(msg) => showToast(msg, 'success')}
             />
           )}
 
@@ -516,16 +521,581 @@ function OverviewSection({
 }
 
 /* =========================================================================
+   ESP32 HARDWARE TRIGGER & SINGLE-IMAGE AUTO-CAPTURE BRIDGE
+   ========================================================================= */
+type CapturePhase =
+  | 'idle'
+  | 'starting-camera'
+  | 'countdown'
+  | 'capturing'
+  | 'result'
+  | 'error'
+
+function Esp32TriggerBridge({
+  onRecordAdded,
+  onError,
+  onSuccess,
+}: {
+  onRecordAdded: (r: AttendanceRecord) => void
+  onError: (msg: string) => void
+  onSuccess: (msg: string) => void
+}) {
+  const [triggerStatus, setTriggerStatus] = useState<TriggerStatus>({ active: false, triggered_at: null })
+  const [phase, setPhase] = useState<CapturePhase>('idle')
+  const [countdown, setCountdown] = useState<number>(3)
+  const [errorMessage, setErrorMessage] = useState<string>('')
+  const [result, setResult] = useState<MarkAttendanceResult | null>(null)
+  const [simulating, setSimulating] = useState(false)
+  const [errorRetryCountdown, setErrorRetryCountdown] = useState<number>(4)
+
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const cycleIdRef = useRef<number>(0)
+  const prevActiveRef = useRef<boolean>(false)
+  const lastHandledTriggeredAtRef = useRef<number | null>(null)
+
+  // Start Camera
+  const startCamera = async (): Promise<MediaStream | null> => {
+    try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => {
+          try {
+            t.stop()
+          } catch {}
+        })
+        streamRef.current = null
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      })
+      streamRef.current = stream
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        videoRef.current.play().catch(() => {})
+      }
+      return stream
+    } catch (err: any) {
+      const msg = 'Unable to access webcam: ' + (err.message || 'Permission denied')
+      onError(msg)
+      setErrorMessage(msg)
+      setPhase('error')
+      return null
+    }
+  }
+
+  // Stop Camera
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => {
+        try {
+          t.stop()
+        } catch {}
+      })
+      streamRef.current = null
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+  }
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopCamera()
+    }
+  }, [])
+
+  // Capture current video frame to Blob
+  const captureFrame = async (): Promise<Blob | null> => {
+    if (!videoRef.current) return null
+    const video = videoRef.current
+    const canvas = document.createElement('canvas')
+    canvas.width = video.videoWidth || 640
+    canvas.height = video.videoHeight || 480
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.95)
+    })
+  }
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  // Complete single-image automated capture flow
+  const startAutoCaptureFlow = async () => {
+    const currentCycle = ++cycleIdRef.current
+    const isCurrent = () => cycleIdRef.current === currentCycle
+
+    setResult(null)
+    setErrorMessage('')
+    setPhase('starting-camera')
+
+    const mediaStream = await startCamera()
+    if (!isCurrent()) {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((t) => {
+          try {
+            t.stop()
+          } catch {}
+        })
+      }
+      return
+    }
+    if (!mediaStream) {
+      setPhase('idle')
+      return
+    }
+
+    // --- STEP 1: Countdown for single frame capture (3 seconds) ---
+    setPhase('countdown')
+    for (let c = 3; c >= 1; c--) {
+      if (!isCurrent()) {
+        stopCamera()
+        return
+      }
+      setCountdown(c)
+      await sleep(1000)
+    }
+    if (!isCurrent()) {
+      stopCamera()
+      return
+    }
+
+    // --- STEP 2: Capture single frame with student face + ID card QR code ---
+    setPhase('capturing')
+    const captureBlob = await captureFrame()
+    if (!isCurrent()) {
+      stopCamera()
+      return
+    }
+    if (!captureBlob) {
+      setErrorMessage('Failed to capture frame from webcam.')
+      setPhase('error')
+      return
+    }
+
+    try {
+      // Call single-image combined endpoint
+      const markRes = await api.markAttendanceSingle(captureBlob)
+      if (!isCurrent()) {
+        stopCamera()
+        return
+      }
+      setResult(markRes)
+
+      // Stop camera stream immediately upon outcome
+      stopCamera()
+      setPhase('result')
+
+      if (markRes.marked && markRes.name && markRes.code) {
+        const newRecord: AttendanceRecord = {
+          code: markRes.code,
+          name: markRes.name,
+          similarity: markRes.similarity,
+          timestamp: markRes.timestamp || new Date().toISOString(),
+        }
+        onRecordAdded(newRecord)
+        onSuccess(`Attendance verified for ${markRes.name} (${markRes.code})! Sent to ESP32.`)
+      } else {
+        onError(`Attendance failed: ${markRes.reason || 'Confidence below threshold'}`)
+      }
+
+      // Automatically reset to idle after 5 seconds to wait for next trigger
+      await sleep(5000)
+      if (!isCurrent()) return
+      setTriggerStatus({ active: false, triggered_at: null })
+      setPhase('idle')
+      setResult(null)
+      prevActiveRef.current = false
+    } catch (err: any) {
+      if (!isCurrent()) {
+        stopCamera()
+        return
+      }
+      stopCamera()
+      const msg = err.message || 'Capture verification failed'
+      setErrorMessage(msg)
+      onError(msg)
+      setPhase('error')
+    }
+  }
+
+  // Poll trigger-status every 1.5 seconds
+  useEffect(() => {
+    let isMounted = true
+    const checkStatus = async () => {
+      try {
+        const res = await api.triggerStatus()
+        if (!isMounted) return
+
+        if (!res.active) {
+          prevActiveRef.current = false
+          setTriggerStatus(res)
+          return
+        }
+
+        // res.active is true; verify if this is a fresh trigger timestamp
+        const isFresh =
+          res.triggered_at != null && res.triggered_at !== lastHandledTriggeredAtRef.current
+
+        if (isFresh && !prevActiveRef.current) {
+          lastHandledTriggeredAtRef.current = res.triggered_at
+          prevActiveRef.current = true
+          setTriggerStatus(res)
+          startAutoCaptureFlow()
+        } else {
+          setTriggerStatus(res)
+        }
+      } catch {
+        // Backend offline or unreachable, ignore during polling
+      }
+    }
+
+    checkStatus()
+    const interval = window.setInterval(checkStatus, 1500)
+    return () => {
+      isMounted = false
+      window.clearInterval(interval)
+    }
+  }, [])
+
+  // Auto-retry effect when phase === 'error'
+  useEffect(() => {
+    if (phase !== 'error') return
+    setErrorRetryCountdown(4)
+    const timer = setInterval(() => {
+      setErrorRetryCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(timer)
+          startAutoCaptureFlow()
+          return 4
+        }
+        return prev - 1
+      })
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [phase])
+
+  // Cancel or reset cycle
+  const handleCancelCycle = async () => {
+    cycleIdRef.current++
+    stopCamera()
+    setPhase('idle')
+    setTriggerStatus({ active: false, triggered_at: null })
+    setResult(null)
+    setErrorMessage('')
+    prevActiveRef.current = true
+    lastHandledTriggeredAtRef.current = triggerStatus.triggered_at || Date.now() / 1000
+
+    try {
+      await api.triggerReset()
+    } catch {
+      // ignore
+    }
+  }
+
+  // Simulate ESP32 proximity trigger
+  const handleSimulateTrigger = async () => {
+    setSimulating(true)
+    try {
+      const now = Date.now() / 1000
+      lastHandledTriggeredAtRef.current = now
+      prevActiveRef.current = true
+      setTriggerStatus({ active: true, triggered_at: now })
+      await api.trigger()
+      startAutoCaptureFlow()
+      onSuccess('ESP32 Proximity Trigger simulated! Starting single-frame capture.')
+    } catch (err: any) {
+      onError('Failed to simulate trigger: ' + err.message)
+    } finally {
+      setSimulating(false)
+    }
+  }
+
+  const isCapturing = phase !== 'idle' && phase !== 'result'
+
+  return (
+    <div
+      className={`rounded-2xl border transition-all duration-300 ${
+        triggerStatus.active || isCapturing
+          ? 'border-amber-500/50 bg-gradient-to-br from-amber-500/10 via-background to-card p-6 shadow-lg ring-2 ring-amber-500/20'
+          : 'border-border bg-card/60 p-4 shadow-sm'
+      }`}
+    >
+      {/* Header bar of the bridge */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div
+            className={`flex size-10 items-center justify-center rounded-xl transition-colors ${
+              triggerStatus.active || isCapturing
+                ? 'bg-amber-500 text-black animate-pulse shadow-md shadow-amber-500/30'
+                : 'bg-muted text-muted-foreground'
+            }`}
+          >
+            <Zap className="size-5" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-bold tracking-tight">ESP32 Auto-Attendance Station</h3>
+              <span
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold ${
+                  triggerStatus.active || isCapturing
+                    ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/40 animate-pulse'
+                    : 'bg-muted text-muted-foreground'
+                }`}
+              >
+                <span
+                  className={`size-1.5 rounded-full ${
+                    triggerStatus.active || isCapturing ? 'bg-amber-500' : 'bg-emerald-500'
+                  }`}
+                />
+                {triggerStatus.active || isCapturing ? 'Proximity Active' : 'Listening (Ultrasonic)'}
+              </span>
+              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-primary/10 text-primary border border-primary/20">
+                Single-Shot ID & Face
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {triggerStatus.active || isCapturing
+                ? `Person detected at sensor ${
+                    triggerStatus.triggered_at
+                      ? `(${formatTime(new Date(triggerStatus.triggered_at * 1000).toISOString())})`
+                      : ''
+                  }. Position your face and ID card in the webcam.`
+                : 'Polling ESP32 signal. When a student stands in front of ultrasonic sensor, camera activates automatically.'}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {!triggerStatus.active && phase === 'idle' && (
+            <button
+              type="button"
+              onClick={handleSimulateTrigger}
+              disabled={simulating}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-semibold text-foreground shadow-sm hover:bg-muted transition-colors disabled:opacity-50 cursor-pointer"
+              title="Test the proximity trigger flow without physical ESP32"
+            >
+              <Cpu className="size-3.5 text-amber-500" />
+              {simulating ? 'Triggering...' : 'Simulate ESP32 Trigger'}
+            </button>
+          )}
+          {isCapturing && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                handleCancelCycle()
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-semibold text-rose-500 hover:bg-rose-500/10 hover:border-rose-500/30 transition-colors cursor-pointer"
+            >
+              <VideoOff className="size-3.5" />
+              Cancel Sequence
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Active Webcam & Single-Image Auto Capture UI */}
+      {isCapturing && (
+        <div className="mt-5 pt-5 border-t border-amber-500/20 space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
+          {/* Instruction header */}
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-2 max-w-xl mx-auto px-1">
+            <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
+              <span className="size-5 rounded-full bg-amber-500 text-black flex items-center justify-center font-bold text-[11px]">
+                1
+              </span>
+              <span>Look at camera with ID Card visible at chest level</span>
+            </div>
+            <span className="text-[11px] text-muted-foreground">
+              Single capture extracts QR & verifies face
+            </span>
+          </div>
+
+          {/* Live Video Preview Box */}
+          <div className="relative aspect-video max-w-xl mx-auto rounded-2xl overflow-hidden border border-amber-500/30 bg-black shadow-2xl">
+            <video
+              ref={(el) => {
+                videoRef.current = el
+                if (el && streamRef.current && el.srcObject !== streamRef.current) {
+                  el.srcObject = streamRef.current
+                  el.play().catch(() => {})
+                }
+              }}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-full object-cover scale-x-[-1]"
+            />
+
+            {/* Overlay: Countdown & Framing Guides */}
+            {phase === 'countdown' && (
+              <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-between p-4 text-white text-center animate-in fade-in duration-200">
+                <div className="inline-flex items-center gap-2 bg-amber-500/95 text-black px-3.5 py-1.5 rounded-full text-xs font-bold shadow-lg">
+                  <ScanLine className="size-4" />
+                  Look at camera & show ID card
+                </div>
+
+                {/* Combined Target Guides */}
+                <div className="relative w-full max-w-xs flex-1 flex flex-col items-center justify-center gap-2 py-1">
+                  {/* Face Guide (Upper) */}
+                  <div className="w-28 h-32 rounded-[50%] border-2 border-dashed border-amber-400/80 bg-amber-500/5 flex items-center justify-center">
+                    <span className="text-[10px] uppercase font-bold text-amber-300 tracking-wider">Face</span>
+                  </div>
+
+                  {/* ID Card Guide (Lower/Chest level) */}
+                  <div className="w-36 h-20 rounded-lg border-2 border-dashed border-emerald-400/80 bg-emerald-500/5 flex items-center justify-center">
+                    <span className="text-[10px] uppercase font-bold text-emerald-300 tracking-wider">ID Card / QR</span>
+                  </div>
+
+                  {/* Countdown Badge in Center */}
+                  <div className="absolute size-14 rounded-full bg-amber-500 text-black flex items-center justify-center font-black text-2xl shadow-xl shadow-amber-500/50 animate-bounce">
+                    {countdown}
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-amber-200 font-medium bg-black/60 px-3 py-1 rounded-md">
+                  Hold ID card steady at chest level so both face and QR code are in frame
+                </p>
+              </div>
+            )}
+
+            {/* Overlay: Capturing & Backend Processing */}
+            {phase === 'capturing' && (
+              <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-3 text-white text-center">
+                <RefreshCw className="size-9 text-amber-400 animate-spin" />
+                <p className="text-sm font-bold">Processing Single Capture...</p>
+                <p className="text-xs text-white/70">
+                  Detecting QR code & matching face against ArcFace embeddings
+                </p>
+              </div>
+            )}
+
+            {/* Overlay: Starting Camera */}
+            {phase === 'starting-camera' && (
+              <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-3 text-white text-center">
+                <Video className="size-8 text-amber-400 animate-pulse" />
+                <p className="text-sm font-semibold">Starting live camera preview...</p>
+              </div>
+            )}
+          </div>
+
+          {/* Error Notice & Auto-retry banner */}
+          {phase === 'error' && (
+            <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-rose-950 dark:text-rose-200 max-w-xl mx-auto animate-in fade-in">
+              <div className="flex items-start gap-3">
+                <AlertCircle className="size-5 text-rose-500 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0 text-xs space-y-2">
+                  <p className="font-bold text-sm">Capture Verification Incomplete</p>
+                  <p>{errorMessage || 'Could not detect both face and QR code in the captured frame.'}</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Tip: Make sure the ID card is held at chest level without glare and you are facing the camera directly.
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Auto-retrying in <span className="font-bold text-foreground">{errorRetryCountdown}s</span>, or action manually:
+                  </p>
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => startAutoCaptureFlow()}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 text-white px-3 py-1.5 text-xs font-semibold hover:bg-rose-600 transition-colors cursor-pointer"
+                    >
+                      <RefreshCw className="size-3.5" />
+                      Retry Scan Now
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleCancelCycle()
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted transition-colors cursor-pointer"
+                    >
+                      Cancel Cycle
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Result Display Banner (Shown after capture flow completes, webcam is stopped) */}
+      {result && phase === 'result' && (
+        <div className="mt-5 pt-5 border-t border-border animate-in fade-in slide-in-from-top-2 duration-300">
+          <div
+            className={`rounded-xl p-4 border transition-all ${
+              result.marked
+                ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-950 dark:text-emerald-200'
+                : 'bg-rose-500/15 border-rose-500/40 text-rose-950 dark:text-rose-200'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              {result.marked ? (
+                <CheckCircle2 className="size-5 text-emerald-500 shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="size-5 text-rose-500 shrink-0 mt-0.5" />
+              )}
+              <div className="text-xs space-y-1 flex-1">
+                <div className="flex items-center justify-between">
+                  <p className="font-bold text-sm">
+                    {result.marked ? 'Attendance Verified & Logged!' : 'Attendance Verification Failed'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleCancelCycle()
+                    }}
+                    className="text-[11px] underline text-muted-foreground hover:text-foreground cursor-pointer"
+                  >
+                    Done / Ready for Next
+                  </button>
+                </div>
+                {result.marked ? (
+                  <>
+                    <p>
+                      <span className="font-semibold">Student:</span> {result.name} ({result.code})
+                    </p>
+                    <p>
+                      <span className="font-semibold">Confidence:</span>{' '}
+                      {result.similarity ? (result.similarity * 100).toFixed(1) : 0}% (Cosine threshold &ge; 40%)
+                    </p>
+                    <p className="text-[11px] opacity-80">
+                      Outcome dispatched to ESP32 LCD. Camera stopped. Ready for next student arrival.
+                    </p>
+                  </>
+                ) : (
+                  <p>
+                    <span className="font-semibold">Reason:</span>{' '}
+                    {result.reason || 'Face embedding did not match decoded QR identity.'}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* =========================================================================
    2. LIVE ATTENDANCE STATION (Camera + QR + Face Verification + Real-time Feed)
    ========================================================================= */
 function LiveAttendanceSection({
   recentRecords,
   onRecordAdded,
   onError,
+  onSuccess,
 }: {
   recentRecords: AttendanceRecord[]
   onRecordAdded: (r: AttendanceRecord) => void
   onError: (msg: string) => void
+  onSuccess?: (msg: string) => void
 }) {
   const [cameraActive, setCameraActive] = useState(false)
   const [qrCodeInput, setQrCodeInput] = useState('')
@@ -688,6 +1258,13 @@ function LiveAttendanceSection({
           </div>
         </div>
       </div>
+
+      {/* ESP32 Hardware Trigger Bridge & Manual Upload Test Mode */}
+      <Esp32TriggerBridge
+        onRecordAdded={onRecordAdded}
+        onError={onError}
+        onSuccess={onSuccess || ((m) => {})}
+      />
 
       <div className="grid gap-6 lg:grid-cols-12">
         {/* Left: Video & Face Capture */}
