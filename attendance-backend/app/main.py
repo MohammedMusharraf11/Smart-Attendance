@@ -17,8 +17,11 @@ from app.qr import decode_qr
 MATCH_THRESHOLD = 0.40  # cosine similarity — tune after real-world testing
 
 # In-memory bridge state for ESP32 trigger and polling
+# "phase" tracks progress through the capture flow (scanning_qr -> blink -> processing -> done)
+# so both the ESP32's LCD and the frontend's live status card can reflect real progress
+# from one shared source, instead of two disconnected state systems.
 trigger_state = {"active": False, "triggered_at": None}
-latest_result = {"available": False}
+latest_result = {"available": False, "phase": "idle"}
 
 app = FastAPI(title="Smart Attendance Backend")
 
@@ -60,12 +63,32 @@ def health():
 
 @app.post("/trigger")
 def trigger():
-    """Called by ESP32 when ultrasonic sensor detects proximity."""
+    """Called by ESP32 when ultrasonic sensor detects proximity.
+    Enforces a 5-second cooldown to prevent rapid re-triggers while
+    the previous cycle is still completing."""
+    now = time.time()
+    last = trigger_state.get("triggered_at")
+    if last and (now - last) < 5.0 and trigger_state.get("active"):
+        return {"status": "debounced", "detail": "Trigger ignored — previous cycle still active"}
     trigger_state["active"] = True
-    trigger_state["triggered_at"] = time.time()
+    trigger_state["triggered_at"] = now
     latest_result.clear()
-    latest_result.update({"available": False})
+    latest_result.update({"available": False, "phase": "scanning_qr"})
     return {"status": "triggered"}
+
+
+@app.post("/phase")
+def set_phase(payload: dict):
+    """
+    Called by the frontend as it moves through the capture flow, so the ESP32's LCD
+    and the frontend's own live status card can both reflect real progress.
+    Expected body: {"phase": "scanning_qr" | "blink" | "processing"}
+    """
+    phase = payload.get("phase")
+    if phase not in ("scanning_qr", "blink", "processing"):
+        raise HTTPException(400, "phase must be one of: scanning_qr, blink, processing")
+    latest_result["phase"] = phase
+    return {"status": "ok", "phase": phase}
 
 
 @app.post("/trigger/reset")
@@ -199,7 +222,7 @@ def _process_attendance_match(qr_code_clean: str, embedding: np.ndarray) -> dict
             "timestamp": timestamp,
         }
         latest_result.clear()
-        latest_result.update({**result, "available": True})
+        latest_result.update({**result, "available": True, "phase": "done"})
         trigger_state["active"] = False
         return result
 
@@ -211,7 +234,7 @@ def _process_attendance_match(qr_code_clean: str, embedding: np.ndarray) -> dict
         "reason": "mismatch or below confidence threshold",
     }
     latest_result.clear()
-    latest_result.update({**result, "available": True})
+    latest_result.update({**result, "available": True, "phase": "done"})
     trigger_state["active"] = False
     return result
 
@@ -258,4 +281,3 @@ async def mark_attendance_single_endpoint(image: UploadFile = File(...)):
 def get_recent_attendance_records(limit: int = 50):
     """List recent attendance logs from SQLite."""
     return {"records": get_recent_attendance(limit=limit)}
-

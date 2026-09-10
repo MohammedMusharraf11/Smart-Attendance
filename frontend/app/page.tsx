@@ -522,13 +522,14 @@ function OverviewSection({
 }
 
 /* =========================================================================
-   ESP32 HARDWARE TRIGGER & SINGLE-IMAGE AUTO-CAPTURE BRIDGE
+   ESP32 HARDWARE TRIGGER & 3-PHASE AUTO-CAPTURE BRIDGE
    ========================================================================= */
 type CapturePhase =
   | 'idle'
   | 'starting-camera'
-  | 'countdown'
-  | 'capturing'
+  | 'scanning_qr'
+  | 'blink'
+  | 'processing'
   | 'result'
   | 'error'
 
@@ -544,6 +545,7 @@ function Esp32TriggerBridge({
   const [triggerStatus, setTriggerStatus] = useState<TriggerStatus>({ active: false, triggered_at: null })
   const [phase, setPhase] = useState<CapturePhase>('idle')
   const [countdown, setCountdown] = useState<number>(3)
+  const [decodedQr, setDecodedQr] = useState<string>('')
   const [errorMessage, setErrorMessage] = useState<string>('')
   const [result, setResult] = useState<MarkAttendanceResult | null>(null)
   const [simulating, setSimulating] = useState(false)
@@ -624,12 +626,13 @@ function Esp32TriggerBridge({
 
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-  // Complete single-image automated capture flow
+  // Complete 3-phase automated capture flow (QR -> Blink -> Processing)
   const startAutoCaptureFlow = async () => {
     const currentCycle = ++cycleIdRef.current
     const isCurrent = () => cycleIdRef.current === currentCycle
 
     setResult(null)
+    setDecodedQr('')
     setErrorMessage('')
     setPhase('starting-camera')
 
@@ -649,8 +652,10 @@ function Esp32TriggerBridge({
       return
     }
 
-    // --- STEP 1: Countdown for single frame capture (3 seconds) ---
-    setPhase('countdown')
+    // --- PHASE 1: SCANNING QR ---
+    setPhase('scanning_qr')
+    await api.setPhase('scanning_qr')
+
     for (let c = 3; c >= 1; c--) {
       if (!isCurrent()) {
         stopCamera()
@@ -664,22 +669,67 @@ function Esp32TriggerBridge({
       return
     }
 
-    // --- STEP 2: Capture single frame with student face + ID card QR code ---
-    setPhase('capturing')
-    const captureBlob = await captureFrame()
+    const qrBlob = await captureFrame()
     if (!isCurrent()) {
       stopCamera()
       return
     }
-    if (!captureBlob) {
+    if (!qrBlob) {
       setErrorMessage('Failed to capture frame from webcam.')
       setPhase('error')
       return
     }
 
+    let detectedCode: string | null = null
     try {
-      // Call single-image combined endpoint
-      const markRes = await api.markAttendanceSingle(captureBlob)
+      const qrRes = await api.qrDecode(qrBlob)
+      if (qrRes?.data) {
+        detectedCode = qrRes.data.trim().toUpperCase()
+        setDecodedQr(detectedCode)
+      }
+    } catch {}
+
+    // --- PHASE 2: BLINK LIVENESS CHECK ---
+    setPhase('blink')
+    await api.setPhase('blink')
+
+    for (let c = 3; c >= 1; c--) {
+      if (!isCurrent()) {
+        stopCamera()
+        return
+      }
+      setCountdown(c)
+      await sleep(1000)
+    }
+    if (!isCurrent()) {
+      stopCamera()
+      return
+    }
+
+    // --- PHASE 3: PROCESSING & VERIFICATION ---
+    setPhase('processing')
+    await api.setPhase('processing')
+
+    const faceBlob = await captureFrame()
+    if (!isCurrent()) {
+      stopCamera()
+      return
+    }
+    if (!faceBlob) {
+      setErrorMessage('Failed to capture face photo from camera.')
+      setPhase('error')
+      return
+    }
+
+    try {
+      let markRes: MarkAttendanceResult
+      if (detectedCode) {
+        markRes = await api.markAttendance(detectedCode, faceBlob)
+      } else {
+        // Combined fallback if QR was in the same frame as the face
+        markRes = await api.markAttendanceSingle(faceBlob)
+      }
+
       if (!isCurrent()) {
         stopCamera()
         return
@@ -906,12 +956,20 @@ function Esp32TriggerBridge({
           <div className="flex flex-col sm:flex-row items-center justify-between gap-2 max-w-xl mx-auto px-1">
             <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
               <span className="size-5 rounded-full bg-amber-500 text-black flex items-center justify-center font-bold text-[11px]">
-                1
+                {phase === 'scanning_qr' ? '1' : phase === 'blink' ? '2' : phase === 'processing' ? '3' : '•'}
               </span>
-              <span>Look at camera with ID Card visible at chest level</span>
+              <span>
+                {phase === 'scanning_qr'
+                  ? 'Step 1/3: Scan your ID card QR code'
+                  : phase === 'blink'
+                  ? 'Step 2/3: Look at camera and blink now'
+                  : phase === 'processing'
+                  ? 'Step 3/3: Verifying biometric match...'
+                  : 'Starting camera...'}
+              </span>
             </div>
-            <span className="text-[11px] text-muted-foreground">
-              Single capture extracts QR & verifies face
+            <span className="text-[11px] text-muted-foreground font-mono">
+              ESP32 LCD Sync: {phase}
             </span>
           </div>
 
@@ -931,46 +989,67 @@ function Esp32TriggerBridge({
               className="w-full h-full object-cover scale-x-[-1]"
             />
 
-            {/* Overlay: Countdown & Framing Guides */}
-            {phase === 'countdown' && (
+            {/* Phase 1: Scanning QR */}
+            {phase === 'scanning_qr' && (
               <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-between p-4 text-white text-center animate-in fade-in duration-200">
                 <div className="inline-flex items-center gap-2 bg-amber-500/95 text-black px-3.5 py-1.5 rounded-full text-xs font-bold shadow-lg">
                   <ScanLine className="size-4" />
-                  Look at camera & show ID card
+                  Step 1: Scan your ID card QR code
                 </div>
 
-                {/* Combined Target Guides */}
                 <div className="relative w-full max-w-xs flex-1 flex flex-col items-center justify-center gap-2 py-1">
-                  {/* Face Guide (Upper) */}
-                  <div className="w-28 h-32 rounded-[50%] border-2 border-dashed border-amber-400/80 bg-amber-500/5 flex items-center justify-center">
-                    <span className="text-[10px] uppercase font-bold text-amber-300 tracking-wider">Face</span>
+                  <div className="w-44 h-32 rounded-xl border-2 border-dashed border-emerald-400/90 bg-emerald-500/10 flex flex-col items-center justify-center gap-1 shadow-lg">
+                    <QrCode className="size-8 text-emerald-300 animate-pulse" />
+                    <span className="text-[11px] uppercase font-bold text-emerald-300 tracking-wider">ID Card QR</span>
                   </div>
 
-                  {/* ID Card Guide (Lower/Chest level) */}
-                  <div className="w-36 h-20 rounded-lg border-2 border-dashed border-emerald-400/80 bg-emerald-500/5 flex items-center justify-center">
-                    <span className="text-[10px] uppercase font-bold text-emerald-300 tracking-wider">ID Card / QR</span>
-                  </div>
-
-                  {/* Countdown Badge in Center */}
                   <div className="absolute size-14 rounded-full bg-amber-500 text-black flex items-center justify-center font-black text-2xl shadow-xl shadow-amber-500/50 animate-bounce">
                     {countdown}
                   </div>
                 </div>
 
                 <p className="text-[11px] text-amber-200 font-medium bg-black/60 px-3 py-1 rounded-md">
-                  Hold ID card steady at chest level so both face and QR code are in frame
+                  Hold your ID card steady so the QR code is clearly visible
                 </p>
               </div>
             )}
 
-            {/* Overlay: Capturing & Backend Processing */}
-            {phase === 'capturing' && (
-              <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-3 text-white text-center">
-                <RefreshCw className="size-9 text-amber-400 animate-spin" />
-                <p className="text-sm font-bold">Processing Single Capture...</p>
-                <p className="text-xs text-white/70">
-                  Detecting QR code & matching face against ArcFace embeddings
+            {/* Phase 2: Blink Liveness Check */}
+            {phase === 'blink' && (
+              <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-between p-4 text-white text-center animate-in fade-in duration-200">
+                <div className="inline-flex items-center gap-2 bg-sky-500/95 text-white px-3.5 py-1.5 rounded-full text-xs font-bold shadow-lg">
+                  <Eye className="size-4" />
+                  Step 2: Look at camera and blink now
+                </div>
+
+                <div className="relative w-full max-w-xs flex-1 flex flex-col items-center justify-center gap-2 py-1">
+                  <div className="w-32 h-40 rounded-[50%] border-2 border-dashed border-sky-400/90 bg-sky-500/10 flex flex-col items-center justify-center gap-1 shadow-lg">
+                    <Eye className="size-8 text-sky-300 animate-pulse" />
+                    <span className="text-[11px] uppercase font-bold text-sky-300 tracking-wider">Face & Blink</span>
+                  </div>
+
+                  <div className="absolute size-14 rounded-full bg-sky-500 text-white flex items-center justify-center font-black text-2xl shadow-xl shadow-sky-500/50 animate-bounce">
+                    {countdown}
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-sky-200 font-medium bg-black/60 px-3 py-1 rounded-md">
+                  Look directly into the camera and blink naturally
                 </p>
+              </div>
+            )}
+
+            {/* Phase 3: Processing & Verification */}
+            {phase === 'processing' && (
+              <div className="absolute inset-0 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center gap-3 text-white text-center">
+                <RefreshCw className="size-10 text-amber-400 animate-spin" />
+                <p className="text-base font-bold">Verifying... Please wait</p>
+                <p className="text-xs text-white/70 max-w-xs">
+                  Extracting ArcFace 512-d embeddings & validating against student record
+                </p>
+                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                  Transmitting result to ESP32 LCD
+                </span>
               </div>
             )}
 
@@ -1161,10 +1240,68 @@ function HardwareDeviceLiveCard({
     connectWebSocket()
 
     pollInterval = setInterval(async () => {
+      try {
+        const latest = await api.latestResult()
+        if (isMounted && latest) {
+          if (latest.phase === 'scanning_qr') {
+            setDeviceState({
+              state: 'scan_qr',
+              detail: 'ESP32 LCD: Scan your ID card QR code...',
+              timestamp: Date.now() / 1000,
+            })
+            return
+          } else if (latest.phase === 'blink') {
+            setDeviceState({
+              state: 'blink',
+              detail: 'ESP32 LCD: Look at camera and blink now',
+              timestamp: Date.now() / 1000,
+            })
+            return
+          } else if (latest.phase === 'processing') {
+            setDeviceState({
+              state: 'processing',
+              detail: 'ESP32 LCD: Verifying... Please wait',
+              timestamp: Date.now() / 1000,
+            })
+            return
+          } else if (latest.available || latest.phase === 'done') {
+            if (latest.marked && latest.name && latest.code) {
+              const ts = latest.timestamp ? new Date(latest.timestamp).getTime() / 1000 : Date.now() / 1000
+              if (ts !== lastRecordedTimestamp.current) {
+                lastRecordedTimestamp.current = ts
+                setDeviceState({
+                  state: 'result_ok',
+                  student_name: latest.name,
+                  student_code: latest.code,
+                  similarity: latest.similarity || 1.0,
+                  detail: 'Attendance verified and logged',
+                  timestamp: ts,
+                })
+                onRecordAdded({
+                  name: latest.name,
+                  code: latest.code,
+                  similarity: latest.similarity || 1.0,
+                  timestamp: latest.timestamp || new Date().toISOString(),
+                })
+                onSuccess?.(`Attendance verified for ${latest.name} (${latest.code})!`)
+              }
+              return
+            } else if (latest.marked === false) {
+              setDeviceState({
+                state: 'result_fail',
+                detail: latest.reason || 'Verification mismatch or low confidence',
+                timestamp: Date.now() / 1000,
+              })
+              return
+            }
+          }
+        }
+      } catch {}
+
       if (!wsConnected) {
         try {
           const st = await api.getDeviceState()
-          if (isMounted) {
+          if (isMounted && st) {
             setDeviceState(st)
             if (
               st.state === 'result_ok' &&
@@ -1184,7 +1321,7 @@ function HardwareDeviceLiveCard({
           }
         } catch {}
       }
-    }, 2000)
+    }, 1000)
 
     return () => {
       isMounted = false
@@ -1196,7 +1333,7 @@ function HardwareDeviceLiveCard({
   const handleManualTrigger = async () => {
     setTriggering(true)
     try {
-      await api.triggerDevice()
+      await api.trigger()
       onSuccess?.('ESP32 Proximity Trigger simulated! Hardware cycle started.')
     } catch (e: any) {
       onError(e.message || 'Failed to trigger device cycle')
@@ -1736,7 +1873,7 @@ function LiveAttendanceSection({
               </thead>
               <tbody className="divide-y divide-border">
                 {recentRecords.slice(0, 8).map((r, i) => (
-                  <tr key={r.id || i} className="hover:bg-muted/30 transition-colors">
+                  <tr key={`${r.code}-${r.timestamp}-${i}`} className="hover:bg-muted/30 transition-colors">
                     <td className="px-4 py-3 font-semibold flex items-center gap-2">
                       <div className="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary font-bold text-xs">
                         {getInitials(r.name)}

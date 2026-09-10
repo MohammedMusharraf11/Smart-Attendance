@@ -412,29 +412,41 @@ class DeviceController:
             cap.release()
 
     def _loop(self):
-        """Background thread loop: listens for serial TRIGGER and dispatches cycles."""
-        logger.info("Device controller background loop started.")
-        self.open_serial()
+        """Background thread loop: listens for serial TRIGGER and dispatches cycles.
+
+        When ESP32 communicates over WiFi (the default), the serial connection is
+        not used. The loop simply idles and waits for trigger_cycle_now() calls
+        from the HTTP endpoints. Set ESP32_SERIAL_MODE=1 to enable USB serial.
+        """
+        use_serial = os.environ.get("ESP32_SERIAL_MODE", "").strip() in ("1", "true", "yes")
+
+        if use_serial:
+            logger.info("Device controller started in USB SERIAL mode.")
+            self.open_serial()
+        else:
+            logger.info("Device controller started in WiFi/HTTP mode (no serial). "
+                        "Triggers come from POST /trigger. Set ESP32_SERIAL_MODE=1 to use serial.")
 
         while self.running:
             try:
-                if self.serial_conn and self.serial_conn.is_open:
+                if use_serial and self.serial_conn and self.serial_conn.is_open:
                     if self.serial_conn.in_waiting > 0:
                         raw_line = self.serial_conn.readline().decode("utf-8", errors="ignore").strip()
                         if raw_line:
                             logger.info(f"RX <- ESP32: {raw_line}")
                             if raw_line == "TRIGGER":
                                 self.run_cycle()
-                else:
-                    # Attempt reconnect every 5s if disconnected
-                    time.sleep(2.0)
+                elif use_serial:
+                    # Attempt reconnect every 5s if disconnected (serial mode only)
+                    time.sleep(5.0)
                     if not self.serial_conn:
                         self.open_serial()
+                    continue
 
-                time.sleep(0.1)
+                time.sleep(0.2)
             except Exception as e:
                 logger.error(f"Error in device controller loop: {e}")
-                time.sleep(1.0)
+                time.sleep(3.0)
 
         if self.serial_conn and self.serial_conn.is_open:
             try:

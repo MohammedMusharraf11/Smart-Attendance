@@ -162,7 +162,19 @@ export const api = {
 
   triggerStatus: () => request<TriggerStatus>('/trigger-status'),
 
-  latestResult: () => request<LatestResult>('/latest-result'),
+  latestResult: () => request<LatestResult & { phase?: string }>('/latest-result'),
+
+  setPhase: async (phase: 'scanning_qr' | 'blink' | 'processing') => {
+    try {
+      return await request<{ status: string; phase: string }>('/phase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phase }),
+      })
+    } catch {
+      return null
+    }
+  },
 
   getDeviceState: () => request<DeviceState>('/device-state'),
 
