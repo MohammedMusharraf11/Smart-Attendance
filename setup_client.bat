@@ -52,3 +52,4 @@ echo   You can now launch the system anytime using start_kiosk.bat
 echo ============================================================
 echo.
 pause
+
