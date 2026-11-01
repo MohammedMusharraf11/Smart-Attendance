@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Temporary debug bursts
+scratch/latest_burst/
+scratch/bursts/

@@ -23,6 +23,19 @@ export type QRDecodeResult = {
   data: string
 }
 
+export type LivenessResult = {
+  passed: boolean
+  reason: string
+  frames_total: number
+  frames_with_face: number
+  baseline_ear: number
+  min_ear: number
+  closed_run_length: number
+  best_frame_index: number
+  closed_threshold?: number
+  open_threshold?: number
+}
+
 export type MarkAttendanceResult = {
   marked: boolean
   code?: string
@@ -32,6 +45,7 @@ export type MarkAttendanceResult = {
   qr_code?: string
   face_predicted?: string | null
   reason?: string
+  liveness?: LivenessResult
 }
 
 export type HealthStatus = {
@@ -131,6 +145,20 @@ export const api = {
     })
   },
 
+  markAttendanceLive: async (qrCode: string, frameBlobs: Blob[]): Promise<MarkAttendanceResult> => {
+    const form = new FormData()
+    form.append('qr_code', qrCode)
+    frameBlobs.forEach((blob, idx) => {
+      const pad = String(idx).padStart(2, '0')
+      form.append('frames', blob, `frame_${pad}.jpg`)
+    })
+
+    return request<MarkAttendanceResult>('/mark-attendance-live', {
+      method: 'POST',
+      body: form,
+    })
+  },
+
   markAttendanceSingle: async (imageFile: File | Blob) => {
     const form = new FormData()
     form.append('image', imageFile, 'capture.jpg')
@@ -159,6 +187,18 @@ export const api = {
     request<{ status: string }>('/trigger/reset', {
       method: 'POST',
     }),
+
+  triggerFail: async (reason = 'verification_failed') => {
+    try {
+      return await request<{ status: string }>('/trigger/fail', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      })
+    } catch {
+      return null
+    }
+  },
 
   triggerStatus: () => request<TriggerStatus>('/trigger-status'),
 

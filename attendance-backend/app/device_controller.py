@@ -45,6 +45,13 @@ except ImportError:
 
 from app.attendance_log import mark_attendance
 from app.db import query_best_match
+from app.liveness import (
+    LEFT_EYE_INDICES,
+    RIGHT_EYE_INDICES,
+    calculate_ear,
+    extract_frame_landmarks,
+    get_face_landmarker,
+)
 from app.model import get_embedding
 from app.qr import decode_qr
 
@@ -59,32 +66,6 @@ LIVENESS_BURST_SECONDS = float(os.environ.get("LIVENESS_BURST_SEC", "3.0"))
 EAR_CLOSED_THRESHOLD = 0.21  # Eye considered closed when EAR < this
 EAR_OPEN_THRESHOLD = 0.24    # Eye considered open when EAR >= this
 MATCH_THRESHOLD = 0.40       # Cosine similarity threshold
-
-# MediaPipe Eye Landmark Indices (canonical 6-point landmarks)
-LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]   # outer, top1, top2, inner, bottom2, bottom1
-RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380] # outer, top1, top2, inner, bottom2, bottom1
-
-
-def calculate_ear(eye_landmarks: List[List[float]]) -> float:
-    """
-    Compute Eye Aspect Ratio (EAR) given 6 (x, y) landmark points:
-      p1 = outer corner, p4 = inner corner
-      p2, p3 = top eyelid points
-      p6, p5 = bottom eyelid points
-    EAR = (||p2 - p6|| + ||p3 - p5||) / (2 * ||p1 - p4||)
-    """
-    p1, p2, p3, p4, p5, p6 = eye_landmarks
-
-    def dist(a, b):
-        return math.hypot(a[0] - b[0], a[1] - b[1])
-
-    vertical_1 = dist(p2, p6)
-    vertical_2 = dist(p3, p5)
-    horizontal = dist(p1, p4)
-
-    if horizontal < 1e-6:
-        return 0.0
-    return (vertical_1 + vertical_2) / (2.0 * horizontal)
 
 
 class DeviceController:
@@ -116,14 +97,11 @@ class DeviceController:
     def _get_face_mesh(self):
         if not HAS_MEDIAPIPE:
             return None
-        if self._face_mesh is None:
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                max_num_faces=1,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-        return self._face_mesh
+        try:
+            return get_face_landmarker()
+        except Exception as e:
+            logger.warning(f"Could not load FaceLandmarker: {e}")
+            return None
 
     def set_async_loop(self, loop: asyncio.AbstractEventLoop):
         """Set the event loop for broadcasting WebSocket updates from background thread."""
@@ -304,17 +282,8 @@ class DeviceController:
                     clearest_frame = frame.copy()
 
                 if face_mesh is not None:
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = face_mesh.process(rgb_frame)
-
-                    if results.multi_face_landmarks:
-                        landmarks = results.multi_face_landmarks[0].landmark
-                        h, w = frame.shape[:2]
-
-                        # Extract left and right eye (x, y) coordinates
-                        left_pts = [[landmarks[i].x * w, landmarks[i].y * h] for i in LEFT_EYE_INDICES]
-                        right_pts = [[landmarks[i].x * w, landmarks[i].y * h] for i in RIGHT_EYE_INDICES]
-
+                    right_pts, left_pts = extract_frame_landmarks(face_mesh, frame)
+                    if right_pts is not None and left_pts is not None:
                         left_ear = calculate_ear(left_pts)
                         right_ear = calculate_ear(right_pts)
                         avg_ear = (left_ear + right_ear) / 2.0

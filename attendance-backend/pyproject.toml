@@ -14,5 +14,6 @@ dependencies = [
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.52.4",
     "pyserial>=3.5",
-    "mediapipe>=0.10.14",
+    "mediapipe==1.0.1",
+    "pyzbar>=0.1.9",
 ]

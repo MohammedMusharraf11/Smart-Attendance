@@ -1,18 +1,24 @@
 import asyncio
 import io
+import logging
+from pathlib import Path
 import time
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 from app.attendance_log import init_db, mark_attendance, get_recent_attendance
 from app.db import delete_student, enroll_embedding, list_students, query_best_match
 from app.device_controller import device_controller
+from app.liveness import check_blink
 from app.model import get_embedding, get_model
 from app.qr import decode_qr
+
+logger = logging.getLogger("main")
 
 MATCH_THRESHOLD = 0.40  # cosine similarity — tune after real-world testing
 
@@ -96,6 +102,14 @@ def trigger_reset():
     """Reset trigger state when cancelled or timed out."""
     trigger_state["active"] = False
     return {"status": "reset"}
+
+
+@app.post("/trigger/fail")
+def trigger_fail(payload: dict = None):
+    """Explicitly reports a failed cycle from kiosk to ESP32."""
+    reason = (payload or {}).get("reason", "verification_failed")
+    _record_failure_state(reason, "")
+    return {"status": "recorded"}
 
 
 @app.get("/trigger-status")
@@ -203,6 +217,21 @@ async def qr_decode(image: UploadFile = File(...)):
     return {"data": data}
 
 
+def _record_failure_state(reason: str, qr_code: str = None) -> dict:
+    """Updates latest_result and trigger_state so hardware and dashboard never hang on failure."""
+    fail_res = {
+        "marked": False,
+        "available": True,
+        "phase": "done",
+        "reason": reason,
+        "qr_code": qr_code,
+    }
+    latest_result.clear()
+    latest_result.update(fail_res)
+    trigger_state["active"] = False
+    return fail_res
+
+
 def _process_attendance_match(qr_code_clean: str, embedding: np.ndarray) -> dict:
     face_code, face_name, score = query_best_match(embedding)
 
@@ -256,6 +285,91 @@ async def mark_attendance_endpoint(qr_code: str = Form(...), image: UploadFile =
     return _process_attendance_match(qr_code_clean, embedding)
 
 
+@app.post("/mark-attendance-live")
+def mark_attendance_live_endpoint(
+    qr_code: str = Form(...),
+    frames: list[UploadFile] = File(...),
+):
+    """
+    Live kiosk verification endpoint with server-side adaptive MediaPipe EAR blink detection.
+    Requires 10-40 downscaled frames (~10 fps over 3s burst).
+    Guarantees state recovery on ANY failure so ESP32 and frontend never hang.
+    """
+    qr_code_clean = qr_code.strip().upper()
+    try:
+        # Validate frame count (10-40 frames)
+        if len(frames) < 10 or len(frames) > 40:
+            reason = f"Invalid frame count: received {len(frames)}, expected 10-40 frames"
+            _record_failure_state(reason, qr_code_clean)
+            raise HTTPException(400, reason)
+
+        # Sort frames by filename to ensure strictly temporal order (frame_00.jpg, frame_01.jpg, ...)
+        sorted_frames = sorted(frames, key=lambda f: f.filename or "")
+
+        # Read frames and validate per-frame file size (<= 1MB)
+        decoded_images: list[np.ndarray] = []
+        for file in sorted_frames:
+            contents = file.file.read()
+            if len(contents) > 1_048_576:
+                reason = f"Frame {file.filename} exceeds maximum size of 1MB ({len(contents)} bytes)"
+                _record_failure_state(reason, qr_code_clean)
+                raise HTTPException(400, reason)
+            img = read_upload_to_bgr(contents)
+            decoded_images.append(img)
+
+        # Run adaptive Eye Aspect Ratio blink check
+        liveness_res = check_blink(decoded_images)
+        log_msg = (
+            f"[LIVENESS] code={qr_code_clean} passed={liveness_res['passed']} "
+            f"reason={liveness_res['reason']} baseline_ear={liveness_res.get('baseline_ear')} "
+            f"min_ear={liveness_res.get('min_ear')} closed_run={liveness_res.get('closed_run_length')} "
+            f"faces={liveness_res.get('frames_with_face')}/{liveness_res.get('frames_total')}"
+        )
+        logger.info(log_msg)
+        print(f" {log_msg}")
+
+        if not liveness_res["passed"]:
+            fail_reason = liveness_res["reason"]
+            _record_failure_state(fail_reason, qr_code_clean)
+            return {
+                "marked": False,
+                "reason": fail_reason,
+                "liveness": liveness_res,
+                "qr_code": qr_code_clean,
+            }
+
+        # Select the sharpest open frame identified by liveness check
+        best_idx = liveness_res.get("best_frame_index", 0)
+        best_frame = decoded_images[best_idx]
+        embedding = get_embedding(best_frame)
+
+        if embedding is None:
+            reason = "no_face_in_best_frame"
+            _record_failure_state(reason, qr_code_clean)
+            return {
+                "marked": False,
+                "reason": reason,
+                "liveness": liveness_res,
+                "qr_code": qr_code_clean,
+            }
+
+        result = _process_attendance_match(qr_code_clean, embedding)
+        result["liveness"] = liveness_res
+        logger.info(
+            f"Live attendance verification for {qr_code_clean}: marked={result.get('marked')} "
+            f"score={result.get('similarity')} name={result.get('name')}"
+        )
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        reason = f"Internal server error: {str(exc)}"
+        logger.error(f"Unhandled exception in /mark-attendance-live: {exc}", exc_info=True)
+        _record_failure_state(reason, qr_code_clean)
+        raise HTTPException(500, reason)
+
+
 @app.post("/mark-attendance-single")
 async def mark_attendance_single_endpoint(image: UploadFile = File(...)):
     """
@@ -281,3 +395,9 @@ async def mark_attendance_single_endpoint(image: UploadFile = File(...)):
 def get_recent_attendance_records(limit: int = 50):
     """List recent attendance logs from SQLite."""
     return {"records": get_recent_attendance(limit=limit)}
+
+
+# Mount Next.js static export if built (runs entire system on port 8000 without Node.js)
+frontend_out = Path(__file__).resolve().parent.parent.parent / "frontend" / "out"
+if frontend_out.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_out), html=True), name="static")

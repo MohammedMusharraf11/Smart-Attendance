@@ -522,18 +522,21 @@ function OverviewSection({
 }
 
 /* =========================================================================
-   ESP32 HARDWARE TRIGGER & 3-PHASE AUTO-CAPTURE BRIDGE
+   ESP32 SMART ATTENDANCE STATION (Unified Auto-Capture & Live Hardware Flow)
    ========================================================================= */
-type CapturePhase =
+type StationPhase =
   | 'idle'
   | 'starting-camera'
-  | 'scanning_qr'
-  | 'blink'
-  | 'processing'
-  | 'result'
-  | 'error'
+  | 'scan_prompt'      // Tell user to scan QR and wait
+  | 'scanning_qr'      // Active multi-frame QR decoding
+  | 'qr_success'       // QR recognized, brief confirmation
+  | 'blink_prompt'     // Tell user to look at camera and blink now
+  | 'capturing_face'   // Snap face frame
+  | 'processing'       // Biometric matching & SQLite logging
+  | 'result'           // Verified successfully
+  | 'error'            // Verification failed or no QR detected
 
-function Esp32TriggerBridge({
+function LiveAttendanceStation({
   onRecordAdded,
   onError,
   onSuccess,
@@ -543,13 +546,14 @@ function Esp32TriggerBridge({
   onSuccess: (msg: string) => void
 }) {
   const [triggerStatus, setTriggerStatus] = useState<TriggerStatus>({ active: false, triggered_at: null })
-  const [phase, setPhase] = useState<CapturePhase>('idle')
+  const [phase, setPhase] = useState<StationPhase>('idle')
   const [countdown, setCountdown] = useState<number>(3)
-  const [decodedQr, setDecodedQr] = useState<string>('')
+  const [detectedCode, setDetectedCode] = useState<string>('')
   const [errorMessage, setErrorMessage] = useState<string>('')
   const [result, setResult] = useState<MarkAttendanceResult | null>(null)
   const [simulating, setSimulating] = useState(false)
-  const [errorRetryCountdown, setErrorRetryCountdown] = useState<number>(4)
+  const [autoResetSeconds, setAutoResetSeconds] = useState<number>(5)
+  const [blinkProgress, setBlinkProgress] = useState<number>(0)
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -557,7 +561,7 @@ function Esp32TriggerBridge({
   const prevActiveRef = useRef<boolean>(false)
   const lastHandledTriggeredAtRef = useRef<number | null>(null)
 
-  // Start Camera
+  // Start Camera Stream
   const startCamera = async (): Promise<MediaStream | null> => {
     try {
       if (streamRef.current) {
@@ -569,7 +573,7 @@ function Esp32TriggerBridge({
         streamRef.current = null
       }
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+        video: { width: { ideal: 1920, min: 1280 }, height: { ideal: 1080, min: 720 }, facingMode: 'user' },
       })
       streamRef.current = stream
       if (videoRef.current) {
@@ -586,7 +590,7 @@ function Esp32TriggerBridge({
     }
   }
 
-  // Stop Camera
+  // Stop Camera Stream
   const stopCamera = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => {
@@ -601,20 +605,20 @@ function Esp32TriggerBridge({
     }
   }
 
-  // Cleanup on unmount
+  // Cleanup on component unmount
   useEffect(() => {
     return () => {
       stopCamera()
     }
   }, [])
 
-  // Capture current video frame to Blob
+  // Capture single video frame as a JPEG Blob
   const captureFrame = async (): Promise<Blob | null> => {
     if (!videoRef.current) return null
     const video = videoRef.current
     const canvas = document.createElement('canvas')
-    canvas.width = video.videoWidth || 640
-    canvas.height = video.videoHeight || 480
+    canvas.width = video.videoWidth || 1280
+    canvas.height = video.videoHeight || 720
     const ctx = canvas.getContext('2d')
     if (!ctx) return null
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
@@ -624,15 +628,36 @@ function Esp32TriggerBridge({
     })
   }
 
+  // Capture downscaled video frame for fast burst upload (640px width, JPEG 0.75)
+  const captureBurstFrame = async (targetWidth = 640): Promise<Blob | null> => {
+    if (!videoRef.current) return null
+    const video = videoRef.current
+    const vw = video.videoWidth || 640
+    const vh = video.videoHeight || 480
+    if (vw === 0 || vh === 0) return null
+
+    const aspect = vh / vw
+    const canvas = document.createElement('canvas')
+    canvas.width = targetWidth
+    canvas.height = Math.round(targetWidth * aspect)
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.7)
+    })
+  }
+
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-  // Complete 3-phase automated capture flow (QR -> Blink -> Processing)
-  const startAutoCaptureFlow = async () => {
+  // Complete Automated Attendance Pipeline
+  const runAttendanceCycle = async () => {
     const currentCycle = ++cycleIdRef.current
     const isCurrent = () => cycleIdRef.current === currentCycle
 
     setResult(null)
-    setDecodedQr('')
+    setDetectedCode('')
     setErrorMessage('')
     setPhase('starting-camera')
 
@@ -652,10 +677,13 @@ function Esp32TriggerBridge({
       return
     }
 
-    // --- PHASE 1: SCANNING QR ---
-    setPhase('scanning_qr')
+    // =========================================================================
+    // PHASE 1: Tell user to scan QR code & wait (Position ID card)
+    // =========================================================================
+    setPhase('scan_prompt')
     await api.setPhase('scanning_qr')
 
+    // 3-second positioning window
     for (let c = 3; c >= 1; c--) {
       if (!isCurrent()) {
         stopCamera()
@@ -669,78 +697,131 @@ function Esp32TriggerBridge({
       return
     }
 
-    const qrBlob = await captureFrame()
+    // Active multi-frame QR scan (tries up to 10 rapid frames over ~3.5s for max reliability)
+    setPhase('scanning_qr')
+    let foundCode = ''
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      if (!isCurrent()) {
+        stopCamera()
+        return
+      }
+      const qrFrame = await captureFrame()
+      if (qrFrame) {
+        try {
+          const qrRes = await api.qrDecode(qrFrame)
+          if (qrRes?.data && qrRes.data.trim().length > 0) {
+            foundCode = qrRes.data.trim().toUpperCase()
+            break
+          }
+        } catch {
+          // Frame decode failed on this attempt, continue
+        }
+      }
+      await sleep(350)
+    }
+
     if (!isCurrent()) {
       stopCamera()
       return
     }
-    if (!qrBlob) {
-      setErrorMessage('Failed to capture frame from webcam.')
+
+    if (!foundCode) {
+      stopCamera()
+      const msg = 'Could not detect QR code from ID card. Please hold ID card steadily in front of the camera.'
+      setErrorMessage(msg)
+      onError(msg)
       setPhase('error')
+      await api.triggerFail('qr_not_detected')
       return
     }
 
-    let detectedCode: string | null = null
-    try {
-      const qrRes = await api.qrDecode(qrBlob)
-      if (qrRes?.data) {
-        detectedCode = qrRes.data.trim().toUpperCase()
-        setDecodedQr(detectedCode)
-      }
-    } catch {}
+    setDetectedCode(foundCode)
+    setPhase('qr_success')
+    // Comfortable pause (2.0s) so user sees green checkmark and puts card away
+    await sleep(2000)
 
-    // --- PHASE 2: BLINK LIVENESS CHECK ---
-    setPhase('blink')
-    await api.setPhase('blink')
-
-    for (let c = 3; c >= 1; c--) {
-      if (!isCurrent()) {
-        stopCamera()
-        return
-      }
-      setCountdown(c)
-      await sleep(1000)
-    }
     if (!isCurrent()) {
       stopCamera()
       return
     }
 
-    // --- PHASE 3: PROCESSING & VERIFICATION ---
+    // =========================================================================
+    // PHASE 2: Burst Frame Capture for Adaptive Eye-Blink Liveness Detection
+    // =========================================================================
+    setPhase('blink_prompt')
+    setBlinkProgress(0)
+    await api.setPhase('blink')
+    await sleep(400) // Brief pause so user sees prompt and has eyes open before recording starts
+
+    // Capture 35 frames continuously over 3.5s (~10 fps) so any blink is caught
+    const targetFrameCount = 35
+    const durationMs = 3500
+    const intervalMs = durationMs / targetFrameCount
+    const burstFrames: Blob[] = []
+    const burstStartTime = performance.now()
+
+    for (let i = 0; i < targetFrameCount; i++) {
+      if (!isCurrent()) {
+        stopCamera()
+        return
+      }
+
+      const frameBlob = await captureBurstFrame(640)
+      if (frameBlob) {
+        burstFrames.push(frameBlob)
+      }
+
+      const progress = Math.min(100, Math.round(((i + 1) / targetFrameCount) * 100))
+      setBlinkProgress(progress)
+
+      const elapsed = performance.now() - burstStartTime
+      const nextExpected = (i + 1) * intervalMs
+      const waitTime = Math.max(0, nextExpected - elapsed)
+      if (waitTime > 0) {
+        await sleep(waitTime)
+      }
+    }
+
+    if (!isCurrent()) {
+      stopCamera()
+      return
+    }
+
+    if (burstFrames.length < 10) {
+      const msg = 'Failed to capture sufficient camera frames for liveness verification.'
+      setErrorMessage(msg)
+      onError(msg)
+      setPhase('error')
+      stopCamera()
+      return
+    }
+
+    // =========================================================================
+    // PHASE 3: Processing & Biometric Verification
+    // =========================================================================
     setPhase('processing')
     await api.setPhase('processing')
 
-    const faceBlob = await captureFrame()
-    if (!isCurrent()) {
-      stopCamera()
-      return
-    }
-    if (!faceBlob) {
-      setErrorMessage('Failed to capture face photo from camera.')
-      setPhase('error')
-      return
-    }
-
     try {
       let markRes: MarkAttendanceResult
-      if (detectedCode) {
-        markRes = await api.markAttendance(detectedCode, faceBlob)
+      if (foundCode) {
+        // Primary path: adaptive server-side blink check on 30-frame burst + ArcFace verification
+        markRes = await api.markAttendanceLive(foundCode, burstFrames)
       } else {
-        // Combined fallback if QR was in the same frame as the face
-        markRes = await api.markAttendanceSingle(faceBlob)
+        // Fallback: If QR wasn't isolated in step 1, evaluate face + card together in single frame
+        markRes = await api.markAttendanceSingle(burstFrames[0])
       }
 
       if (!isCurrent()) {
         stopCamera()
         return
       }
+
+      stopCamera()
       setResult(markRes)
 
-      // Stop camera stream immediately upon outcome
-      stopCamera()
-      setPhase('result')
-
       if (markRes.marked && markRes.name && markRes.code) {
+        setPhase('result')
         const newRecord: AttendanceRecord = {
           code: markRes.code,
           name: markRes.name,
@@ -748,32 +829,61 @@ function Esp32TriggerBridge({
           timestamp: markRes.timestamp || new Date().toISOString(),
         }
         onRecordAdded(newRecord)
-        onSuccess(`Attendance verified for ${markRes.name} (${markRes.code})! Sent to ESP32.`)
-      } else {
-        onError(`Attendance failed: ${markRes.reason || 'Confidence below threshold'}`)
-      }
+        onSuccess(`Attendance verified for ${markRes.name} (${markRes.code})!`)
 
-      // Automatically reset to idle after 5 seconds to wait for next trigger
-      await sleep(5000)
-      if (!isCurrent()) return
-      setTriggerStatus({ active: false, triggered_at: null })
-      setPhase('idle')
-      setResult(null)
-      prevActiveRef.current = false
+        // Start auto-reset countdown
+        setAutoResetSeconds(5)
+      } else {
+        setPhase('error')
+        let failReason = markRes.reason || 'Verification incomplete.'
+        if (failReason === 'no_blink_detected') {
+          failReason = 'Liveness check failed: No eye blink detected. Please blink naturally.'
+        } else if (failReason === 'eyes_not_open') {
+          failReason = 'Liveness check failed: Eyes not clearly open. Please face the camera.'
+        } else if (failReason === 'no_face_or_too_few_frames') {
+          failReason = 'Liveness check failed: Face not clearly visible in frame. Please stand closer.'
+        } else if (failReason === 'no_face_in_best_frame') {
+          failReason = 'Biometric check failed: Could not detect face in verification frame.'
+        } else if (!foundCode) {
+          failReason = 'Could not decode QR code from ID card.'
+        }
+        setErrorMessage(failReason)
+        onError(`Attendance verification failed: ${failReason}`)
+      }
     } catch (err: any) {
       if (!isCurrent()) {
         stopCamera()
         return
       }
       stopCamera()
-      const msg = err.message || 'Capture verification failed'
+      const msg = err.message || 'Verification failed. Please try again.'
       setErrorMessage(msg)
       onError(msg)
       setPhase('error')
     }
   }
 
-  // Poll trigger-status every 1.5 seconds
+  // Auto-reset timer when successful result or failure is displayed
+  useEffect(() => {
+    if (phase !== 'result' && phase !== 'error') return
+    const timer = setInterval(() => {
+      setAutoResetSeconds((prev) => {
+        if (prev <= 1) {
+          clearInterval(timer)
+          setPhase('idle')
+          setTriggerStatus({ active: false, triggered_at: null })
+          setResult(null)
+          setErrorMessage('')
+          prevActiveRef.current = false
+          return 5
+        }
+        return prev - 1
+      })
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [phase])
+
+  // Poll ESP32 trigger status from backend every 1.5s
   useEffect(() => {
     let isMounted = true
     const checkStatus = async () => {
@@ -787,20 +897,19 @@ function Esp32TriggerBridge({
           return
         }
 
-        // res.active is true; verify if this is a fresh trigger timestamp
         const isFresh =
           res.triggered_at != null && res.triggered_at !== lastHandledTriggeredAtRef.current
 
-        if (isFresh && !prevActiveRef.current) {
+        if (isFresh && !prevActiveRef.current && phase === 'idle') {
           lastHandledTriggeredAtRef.current = res.triggered_at
           prevActiveRef.current = true
           setTriggerStatus(res)
-          startAutoCaptureFlow()
+          runAttendanceCycle()
         } else {
           setTriggerStatus(res)
         }
       } catch {
-        // Backend offline or unreachable, ignore during polling
+        // Backend offline or unreachable
       }
     }
 
@@ -810,26 +919,9 @@ function Esp32TriggerBridge({
       isMounted = false
       window.clearInterval(interval)
     }
-  }, [])
-
-  // Auto-retry effect when phase === 'error'
-  useEffect(() => {
-    if (phase !== 'error') return
-    setErrorRetryCountdown(4)
-    const timer = setInterval(() => {
-      setErrorRetryCountdown((prev) => {
-        if (prev <= 1) {
-          clearInterval(timer)
-          startAutoCaptureFlow()
-          return 4
-        }
-        return prev - 1
-      })
-    }, 1000)
-    return () => clearInterval(timer)
   }, [phase])
 
-  // Cancel or reset cycle
+  // Cancel cycle and return cleanly to idle
   const handleCancelCycle = async () => {
     cycleIdRef.current++
     stopCamera()
@@ -842,12 +934,10 @@ function Esp32TriggerBridge({
 
     try {
       await api.triggerReset()
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
-  // Simulate ESP32 proximity trigger
+  // Simulate proximity trigger for testing without ESP32
   const handleSimulateTrigger = async () => {
     setSimulating(true)
     try {
@@ -856,8 +946,8 @@ function Esp32TriggerBridge({
       prevActiveRef.current = true
       setTriggerStatus({ active: true, triggered_at: now })
       await api.trigger()
-      startAutoCaptureFlow()
-      onSuccess('ESP32 Proximity Trigger simulated! Starting single-frame capture.')
+      runAttendanceCycle()
+      onSuccess('ESP32 Ultrasonic Proximity Simulated! Camera starting.')
     } catch (err: any) {
       onError('Failed to simulate trigger: ' + err.message)
     } finally {
@@ -865,605 +955,450 @@ function Esp32TriggerBridge({
     }
   }
 
-  const isCapturing = phase !== 'idle' && phase !== 'result'
+  const isCapturing =
+    phase === 'starting-camera' ||
+    phase === 'scan_prompt' ||
+    phase === 'scanning_qr' ||
+    phase === 'qr_success' ||
+    phase === 'blink_prompt' ||
+    phase === 'capturing_face' ||
+    phase === 'processing'
 
   return (
-    <div
-      className={`rounded-2xl border transition-all duration-300 ${
-        triggerStatus.active || isCapturing
-          ? 'border-amber-500/50 bg-gradient-to-br from-amber-500/10 via-background to-card p-6 shadow-lg ring-2 ring-amber-500/20'
-          : 'border-border bg-card/60 p-4 shadow-sm'
-      }`}
-    >
-      {/* Header bar of the bridge */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <div
-            className={`flex size-10 items-center justify-center rounded-xl transition-colors ${
-              triggerStatus.active || isCapturing
-                ? 'bg-amber-500 text-black animate-pulse shadow-md shadow-amber-500/30'
-                : 'bg-muted text-muted-foreground'
-            }`}
-          >
-            <Zap className="size-5" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h3 className="text-sm font-bold tracking-tight">ESP32 Auto-Attendance Station</h3>
-              <span
-                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold ${
-                  triggerStatus.active || isCapturing
-                    ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/40 animate-pulse'
-                    : 'bg-muted text-muted-foreground'
-                }`}
-              >
+    <div className="space-y-6">
+      {/* Main Station Container */}
+      <div
+        className={`rounded-3xl border transition-all duration-300 overflow-hidden ${
+          isCapturing
+            ? 'border-amber-500/50 bg-gradient-to-b from-card via-background to-card shadow-2xl shadow-amber-500/10 ring-1 ring-amber-500/30'
+            : phase === 'result'
+            ? 'border-emerald-500/50 bg-gradient-to-b from-emerald-500/5 via-card to-card shadow-2xl shadow-emerald-500/10'
+            : phase === 'error'
+            ? 'border-rose-500/50 bg-gradient-to-b from-rose-500/5 via-card to-card shadow-2xl shadow-rose-500/10'
+            : 'border-border bg-card/80 shadow-md backdrop-blur-sm'
+        }`}
+      >
+        {/* Station Top Status Bar */}
+        <div className="p-6 border-b border-border/70 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-center gap-3.5">
+            <div
+              className={`flex size-12 shrink-0 items-center justify-center rounded-2xl transition-all shadow-md ${
+                isCapturing
+                  ? 'bg-amber-500 text-black shadow-amber-500/30 animate-pulse'
+                  : phase === 'result'
+                  ? 'bg-emerald-500 text-white shadow-emerald-500/30'
+                  : phase === 'error'
+                  ? 'bg-rose-500 text-white shadow-rose-500/30'
+                  : 'bg-primary/10 text-primary'
+              }`}
+            >
+              {isCapturing ? (
+                <Radio className="size-6 animate-pulse" />
+              ) : phase === 'result' ? (
+                <CheckCircle2 className="size-6" />
+              ) : phase === 'error' ? (
+                <AlertCircle className="size-6" />
+              ) : (
+                <Zap className="size-6 text-primary" />
+              )}
+            </div>
+
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-base font-bold tracking-tight text-foreground">
+                  ESP32 Smart Attendance Station
+                </h2>
                 <span
-                  className={`size-1.5 rounded-full ${
-                    triggerStatus.active || isCapturing ? 'bg-amber-500' : 'bg-emerald-500'
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold border transition-all ${
+                    isCapturing
+                      ? 'bg-amber-500/15 text-amber-500 border-amber-500/30 animate-pulse'
+                      : phase === 'result'
+                      ? 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30'
+                      : phase === 'error'
+                      ? 'bg-rose-500/15 text-rose-500 border-rose-500/30'
+                      : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20'
                   }`}
-                />
-                {triggerStatus.active || isCapturing ? 'Proximity Active' : 'Listening (Ultrasonic)'}
-              </span>
-              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-primary/10 text-primary border border-primary/20">
-                Single-Shot ID & Face
-              </span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {triggerStatus.active || isCapturing
-                ? `Person detected at sensor ${
-                    triggerStatus.triggered_at
-                      ? `(${formatTime(new Date(triggerStatus.triggered_at * 1000).toISOString())})`
-                      : ''
-                  }. Position your face and ID card in the webcam.`
-                : 'Polling ESP32 signal. When a student stands in front of ultrasonic sensor, camera activates automatically.'}
-            </p>
-          </div>
-        </div>
+                >
+                  <span
+                    className={`size-2 rounded-full ${
+                      isCapturing
+                        ? 'bg-amber-500 animate-ping'
+                        : phase === 'result'
+                        ? 'bg-emerald-500'
+                        : phase === 'error'
+                        ? 'bg-rose-500'
+                        : 'bg-emerald-500'
+                    }`}
+                  />
+                  {isCapturing
+                    ? 'Proximity Active • Verification In Progress'
+                    : phase === 'result'
+                    ? 'Verification Complete'
+                    : phase === 'error'
+                    ? 'Action Required'
+                    : 'Station Ready • Ultrasonic Sensing'}
+                </span>
 
-        <div className="flex items-center gap-2">
-          {!triggerStatus.active && phase === 'idle' && (
-            <button
-              type="button"
-              onClick={handleSimulateTrigger}
-              disabled={simulating}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-semibold text-foreground shadow-sm hover:bg-muted transition-colors disabled:opacity-50 cursor-pointer"
-              title="Test the proximity trigger flow without physical ESP32"
-            >
-              <Cpu className="size-3.5 text-amber-500" />
-              {simulating ? 'Triggering...' : 'Simulate ESP32 Trigger'}
-            </button>
-          )}
-          {isCapturing && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation()
-                handleCancelCycle()
-              }}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-semibold text-rose-500 hover:bg-rose-500/10 hover:border-rose-500/30 transition-colors cursor-pointer"
-            >
-              <VideoOff className="size-3.5" />
-              Cancel Sequence
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Active Webcam & Single-Image Auto Capture UI */}
-      {isCapturing && (
-        <div className="mt-5 pt-5 border-t border-amber-500/20 space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
-          {/* Instruction header */}
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-2 max-w-xl mx-auto px-1">
-            <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
-              <span className="size-5 rounded-full bg-amber-500 text-black flex items-center justify-center font-bold text-[11px]">
-                {phase === 'scanning_qr' ? '1' : phase === 'blink' ? '2' : phase === 'processing' ? '3' : '•'}
-              </span>
-              <span>
-                {phase === 'scanning_qr'
-                  ? 'Step 1/3: Scan your ID card QR code'
-                  : phase === 'blink'
-                  ? 'Step 2/3: Look at camera and blink now'
-                  : phase === 'processing'
-                  ? 'Step 3/3: Verifying biometric match...'
-                  : 'Starting camera...'}
-              </span>
-            </div>
-            <span className="text-[11px] text-muted-foreground font-mono">
-              ESP32 LCD Sync: {phase}
-            </span>
-          </div>
-
-          {/* Live Video Preview Box */}
-          <div className="relative aspect-video max-w-xl mx-auto rounded-2xl overflow-hidden border border-amber-500/30 bg-black shadow-2xl">
-            <video
-              ref={(el) => {
-                videoRef.current = el
-                if (el && streamRef.current && el.srcObject !== streamRef.current) {
-                  el.srcObject = streamRef.current
-                  el.play().catch(() => {})
-                }
-              }}
-              autoPlay
-              playsInline
-              muted
-              className="w-full h-full object-cover scale-x-[-1]"
-            />
-
-            {/* Phase 1: Scanning QR */}
-            {phase === 'scanning_qr' && (
-              <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-between p-4 text-white text-center animate-in fade-in duration-200">
-                <div className="inline-flex items-center gap-2 bg-amber-500/95 text-black px-3.5 py-1.5 rounded-full text-xs font-bold shadow-lg">
-                  <ScanLine className="size-4" />
-                  Step 1: Scan your ID card QR code
-                </div>
-
-                <div className="relative w-full max-w-xs flex-1 flex flex-col items-center justify-center gap-2 py-1">
-                  <div className="w-44 h-32 rounded-xl border-2 border-dashed border-emerald-400/90 bg-emerald-500/10 flex flex-col items-center justify-center gap-1 shadow-lg">
-                    <QrCode className="size-8 text-emerald-300 animate-pulse" />
-                    <span className="text-[11px] uppercase font-bold text-emerald-300 tracking-wider">ID Card QR</span>
-                  </div>
-
-                  <div className="absolute size-14 rounded-full bg-amber-500 text-black flex items-center justify-center font-black text-2xl shadow-xl shadow-amber-500/50 animate-bounce">
-                    {countdown}
-                  </div>
-                </div>
-
-                <p className="text-[11px] text-amber-200 font-medium bg-black/60 px-3 py-1 rounded-md">
-                  Hold your ID card steady so the QR code is clearly visible
-                </p>
-              </div>
-            )}
-
-            {/* Phase 2: Blink Liveness Check */}
-            {phase === 'blink' && (
-              <div className="absolute inset-0 bg-black/35 backdrop-blur-[1px] flex flex-col items-center justify-between p-4 text-white text-center animate-in fade-in duration-200">
-                <div className="inline-flex items-center gap-2 bg-sky-500/95 text-white px-3.5 py-1.5 rounded-full text-xs font-bold shadow-lg">
-                  <Eye className="size-4" />
-                  Step 2: Look at camera and blink now
-                </div>
-
-                <div className="relative w-full max-w-xs flex-1 flex flex-col items-center justify-center gap-2 py-1">
-                  <div className="w-32 h-40 rounded-[50%] border-2 border-dashed border-sky-400/90 bg-sky-500/10 flex flex-col items-center justify-center gap-1 shadow-lg">
-                    <Eye className="size-8 text-sky-300 animate-pulse" />
-                    <span className="text-[11px] uppercase font-bold text-sky-300 tracking-wider">Face & Blink</span>
-                  </div>
-
-                  <div className="absolute size-14 rounded-full bg-sky-500 text-white flex items-center justify-center font-black text-2xl shadow-xl shadow-sky-500/50 animate-bounce">
-                    {countdown}
-                  </div>
-                </div>
-
-                <p className="text-[11px] text-sky-200 font-medium bg-black/60 px-3 py-1 rounded-md">
-                  Look directly into the camera and blink naturally
-                </p>
-              </div>
-            )}
-
-            {/* Phase 3: Processing & Verification */}
-            {phase === 'processing' && (
-              <div className="absolute inset-0 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center gap-3 text-white text-center">
-                <RefreshCw className="size-10 text-amber-400 animate-spin" />
-                <p className="text-base font-bold">Verifying... Please wait</p>
-                <p className="text-xs text-white/70 max-w-xs">
-                  Extracting ArcFace 512-d embeddings & validating against student record
-                </p>
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                  Transmitting result to ESP32 LCD
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-muted text-muted-foreground border border-border">
+                  <span className="size-1.5 rounded-full bg-emerald-500" />
+                  Wi-Fi Synced
                 </span>
               </div>
-            )}
 
-            {/* Overlay: Starting Camera */}
-            {phase === 'starting-camera' && (
-              <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-3 text-white text-center">
-                <Video className="size-8 text-amber-400 animate-pulse" />
-                <p className="text-sm font-semibold">Starting live camera preview...</p>
-              </div>
-            )}
+              <p className="text-xs text-muted-foreground mt-1">
+                {isCapturing
+                  ? 'Follow the on-screen and ESP32 LCD prompts to complete your attendance verification.'
+                  : 'Automatic zero-touch station. Stand in front of the ESP32 ultrasonic sensor (under 15cm) to start.'}
+              </p>
+            </div>
           </div>
 
-          {/* Error Notice & Auto-retry banner */}
-          {phase === 'error' && (
-            <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-rose-950 dark:text-rose-200 max-w-xl mx-auto animate-in fade-in">
-              <div className="flex items-start gap-3">
-                <AlertCircle className="size-5 text-rose-500 shrink-0 mt-0.5" />
-                <div className="flex-1 min-w-0 text-xs space-y-2">
-                  <p className="font-bold text-sm">Capture Verification Incomplete</p>
-                  <p>{errorMessage || 'Could not detect both face and QR code in the captured frame.'}</p>
-                  <p className="text-[11px] text-muted-foreground">
-                    Tip: Make sure the ID card is held at chest level without glare and you are facing the camera directly.
+          <div className="flex items-center gap-2.5 self-start md:self-center">
+            {phase === 'idle' && (
+              <button
+                type="button"
+                onClick={handleSimulateTrigger}
+                disabled={simulating}
+                className="inline-flex items-center gap-2 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 text-xs font-semibold shadow-md transition-all disabled:opacity-50 cursor-pointer"
+                title="Test the entire hardware-triggered flow without physical hardware"
+              >
+                <Cpu className="size-3.5" />
+                {simulating ? 'Triggering Station...' : 'Simulate Sensor Approach'}
+              </button>
+            )}
+
+            {isCapturing && (
+              <button
+                type="button"
+                onClick={handleCancelCycle}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-500 hover:bg-rose-500/20 px-3.5 py-2 text-xs font-semibold transition-colors cursor-pointer"
+              >
+                <VideoOff className="size-3.5" />
+                Cancel Sequence
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* IDLE VIEW: Interactive 3-Step Hardware Pipeline Guide */}
+        {phase === 'idle' && (
+          <div className="p-6 space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {/* Step 1 Card */}
+              <div className="rounded-2xl border border-border/80 bg-background/50 p-4.5 flex flex-col justify-between space-y-3 hover:border-primary/40 transition-colors">
+                <div className="flex items-center justify-between">
+                  <span className="size-7 rounded-xl bg-primary/10 text-primary font-bold text-xs flex items-center justify-center">
+                    1
+                  </span>
+                  <Radio className="size-4 text-muted-foreground" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-foreground">1. Ultrasonic Approach</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    Student walks up within 15cm of the HC-SR04 ultrasonic sensor. ESP32 triggers the station.
                   </p>
-                  <p className="text-[11px] text-muted-foreground">
-                    Auto-retrying in <span className="font-bold text-foreground">{errorRetryCountdown}s</span>, or action manually:
+                </div>
+                <div className="text-[11px] font-mono text-muted-foreground pt-1 border-t border-border/50">
+                  ESP32 → POST /trigger
+                </div>
+              </div>
+
+              {/* Step 2 Card */}
+              <div className="rounded-2xl border border-border/80 bg-background/50 p-4.5 flex flex-col justify-between space-y-3 hover:border-amber-500/40 transition-colors">
+                <div className="flex items-center justify-between">
+                  <span className="size-7 rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-400 font-bold text-xs flex items-center justify-center">
+                    2
+                  </span>
+                  <QrCode className="size-4 text-muted-foreground" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-foreground">2. Scan ID Card QR</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    Student presents ID card. Camera scans the QR code to identify student credentials.
                   </p>
-                  <div className="flex items-center gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => startAutoCaptureFlow()}
-                      className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500 text-white px-3 py-1.5 text-xs font-semibold hover:bg-rose-600 transition-colors cursor-pointer"
-                    >
-                      <RefreshCw className="size-3.5" />
-                      Retry Scan Now
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleCancelCycle()
-                      }}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted transition-colors cursor-pointer"
-                    >
-                      Cancel Cycle
-                    </button>
+                </div>
+                <div className="text-[11px] font-mono text-muted-foreground pt-1 border-t border-border/50">
+                  ESP32 LCD: Scan ID QR
+                </div>
+              </div>
+
+              {/* Step 3 Card */}
+              <div className="rounded-2xl border border-border/80 bg-background/50 p-4.5 flex flex-col justify-between space-y-3 hover:border-sky-500/40 transition-colors">
+                <div className="flex items-center justify-between">
+                  <span className="size-7 rounded-xl bg-sky-500/15 text-sky-600 dark:text-sky-400 font-bold text-xs flex items-center justify-center">
+                    3
+                  </span>
+                  <Eye className="size-4 text-muted-foreground" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-foreground">3. Blink & Face Match</h3>
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                    Student blinks at camera. ArcFace 512-d embeddings verify identity and log attendance.
+                  </p>
+                </div>
+                <div className="text-[11px] font-mono text-muted-foreground pt-1 border-t border-border/50">
+                  ESP32 LCD: Present / Beep
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ACTIVE CAPTURE VIEW: Camera Viewport with Clear Step Guidance */}
+        {isCapturing && (
+          <div className="p-6 space-y-4">
+            {/* Viewport Frame */}
+            <div className="relative aspect-video max-w-2xl mx-auto rounded-2xl overflow-hidden border border-border/80 bg-black shadow-2xl">
+              <video
+                ref={(el) => {
+                  videoRef.current = el
+                  if (el && streamRef.current && el.srcObject !== streamRef.current) {
+                    el.srcObject = streamRef.current
+                    el.play().catch(() => {})
+                  }
+                }}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-cover scale-x-[-1]"
+              />
+
+              {/* Overlay: Starting Camera */}
+              {phase === 'starting-camera' && (
+                <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center gap-3 text-white text-center p-6 animate-in fade-in">
+                  <div className="size-12 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+                  <p className="text-sm font-bold">Initializing High-Definition Webcam...</p>
+                  <p className="text-xs text-white/60">Position yourself in front of the camera</p>
+                </div>
+              )}
+
+              {/* Overlay: Step 1 - Scan ID Card QR Code */}
+              {(phase === 'scan_prompt' || phase === 'scanning_qr') && (
+                <div className="absolute inset-0 bg-black/40 backdrop-blur-[1px] flex flex-col justify-between p-5 text-white text-center animate-in fade-in">
+                  {/* Top Step Banner */}
+                  <div className="flex justify-center">
+                    <div className="inline-flex items-center gap-2 bg-emerald-500/95 text-black px-4 py-1.5 rounded-full text-xs font-bold shadow-xl">
+                      <QrCode className="size-4" />
+                      Step 1 of 3: Scan Student ID Card QR Code
+                    </div>
+                  </div>
+
+                  {/* Center ID Card Reticle */}
+                  <div className="relative flex-1 flex flex-col items-center justify-center py-2">
+                    <div className="relative w-52 h-36 rounded-2xl border-2 border-dashed border-emerald-400/90 bg-emerald-500/10 flex flex-col items-center justify-center gap-2 shadow-2xl overflow-hidden">
+                      {/* Animated Laser Scanline */}
+                      <div className="absolute inset-x-0 h-0.5 bg-emerald-400 shadow-[0_0_12px_#34d399] animate-pulse" />
+                      
+                      <QrCode className="size-10 text-emerald-300 animate-pulse" />
+                      <span className="text-[11px] font-extrabold uppercase tracking-widest text-emerald-300">
+                        {phase === 'scanning_qr' ? 'Scanning QR...' : 'Position ID QR Here'}
+                      </span>
+                    </div>
+
+                    {/* Countdown Badge */}
+                    {phase === 'scan_prompt' && (
+                      <div className="absolute size-14 rounded-full bg-emerald-500 text-black flex items-center justify-center font-black text-2xl shadow-xl shadow-emerald-500/50 animate-bounce">
+                        {countdown}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Bottom Instruction Bar */}
+                  <div className="max-w-md mx-auto">
+                    <p className="text-xs text-emerald-200 font-semibold bg-black/70 backdrop-blur-md px-4 py-2 rounded-xl border border-emerald-500/30">
+                      {phase === 'scanning_qr'
+                        ? 'Reading QR code from ID badge... Please hold steady'
+                        : 'Hold your student ID card steady in front of the camera'}
+                    </p>
                   </div>
                 </div>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Result Display Banner (Shown after capture flow completes, webcam is stopped) */}
-      {result && phase === 'result' && (
-        <div className="mt-5 pt-5 border-t border-border animate-in fade-in slide-in-from-top-2 duration-300">
-          <div
-            className={`rounded-xl p-4 border transition-all ${
-              result.marked
-                ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-950 dark:text-emerald-200'
-                : 'bg-rose-500/15 border-rose-500/40 text-rose-950 dark:text-rose-200'
-            }`}
-          >
-            <div className="flex items-start gap-3">
-              {result.marked ? (
-                <CheckCircle2 className="size-5 text-emerald-500 shrink-0 mt-0.5" />
-              ) : (
-                <XCircle className="size-5 text-rose-500 shrink-0 mt-0.5" />
               )}
-              <div className="text-xs space-y-1 flex-1">
-                <div className="flex items-center justify-between">
-                  <p className="font-bold text-sm">
-                    {result.marked ? 'Attendance Verified & Logged!' : 'Attendance Verification Failed'}
-                  </p>
+
+              {/* Overlay: Step 1 Confirmation (QR Recognized) */}
+              {phase === 'qr_success' && (
+                <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-3 text-white text-center p-6 animate-in zoom-in-95 duration-200">
+                  <div className="size-14 rounded-full bg-emerald-500 text-black flex items-center justify-center shadow-2xl shadow-emerald-500/50 animate-pulse">
+                    <CheckCircle2 className="size-8" />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-lg font-black text-emerald-300">ID Code Recognized: {detectedCode}</p>
+                    <p className="text-xs text-white/80">Get ready to look at the camera for face verification...</p>
+                  </div>
+                </div>
+              )}
+
+              {/* Overlay: Step 2 - Look at Camera & Blink Now */}
+              {(phase === 'blink_prompt' || phase === 'capturing_face') && (
+                <div className="absolute inset-0 bg-black/40 backdrop-blur-[1px] flex flex-col justify-between p-5 text-white text-center animate-in fade-in">
+                  {/* Top Step Banner */}
+                  <div className="flex justify-center">
+                    <div className="inline-flex items-center gap-2 bg-sky-500/95 text-white px-4 py-1.5 rounded-full text-xs font-bold shadow-xl">
+                      <Eye className="size-4" />
+                      Step 2 of 3: Look at Camera & Blink Now
+                    </div>
+                  </div>
+
+                  {/* Center Biometric Face Reticle */}
+                  <div className="relative flex-1 flex flex-col items-center justify-center py-2">
+                    <div className="relative w-44 h-56 rounded-[50%] border-2 border-dashed border-sky-400/90 bg-sky-500/10 flex flex-col items-center justify-center gap-2 shadow-2xl">
+                      <Eye className="size-10 text-sky-300 animate-pulse" />
+                      <span className="text-[11px] font-extrabold uppercase tracking-widest text-sky-300">
+                        Blink Naturally
+                      </span>
+                      <span className="text-[11px] font-mono font-bold text-sky-200 bg-sky-950/70 px-2.5 py-0.5 rounded-full border border-sky-400/30">
+                        {blinkProgress}%
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Bottom Instruction & Progress Bar */}
+                  <div className="max-w-md w-full mx-auto space-y-2">
+                    <div className="w-full bg-black/60 rounded-full h-2.5 overflow-hidden border border-sky-500/30">
+                      <div
+                        className="bg-sky-400 h-full transition-all duration-100 ease-out"
+                        style={{ width: `${blinkProgress}%` }}
+                      />
+                    </div>
+                    <p className="text-xs text-sky-200 font-semibold bg-black/70 backdrop-blur-md px-4 py-2 rounded-xl border border-sky-500/30">
+                      Recording face burst — please blink naturally now
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Overlay: Step 3 - Processing & Verifying */}
+              {phase === 'processing' && (
+                <div className="absolute inset-0 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center gap-3 text-white text-center p-6 animate-in fade-in">
+                  <RefreshCw className="size-12 text-amber-400 animate-spin" />
+                  <div className="space-y-1 max-w-sm">
+                    <p className="text-base font-bold text-white">Verifying Biometric Identity...</p>
+                    <p className="text-xs text-white/70">
+                      Extracting ArcFace 512-d embeddings & validating against student database
+                    </p>
+                  </div>
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    Transmitting result to ESP32 LCD
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* OUTCOME VIEW: Attendance Verified Success Card */}
+        {phase === 'result' && result && (
+          <div className="p-6 animate-in zoom-in-95 duration-200">
+            <div className="rounded-2xl border border-emerald-500/40 bg-emerald-500/10 p-6 text-emerald-950 dark:text-emerald-200 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3.5">
+                  <div className="size-12 rounded-2xl bg-emerald-500 text-white flex items-center justify-center shadow-lg shadow-emerald-500/30">
+                    <CheckCircle2 className="size-7" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-black text-emerald-700 dark:text-emerald-300">
+                      Attendance Verified & Present!
+                    </h3>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Cross-validation matched ID QR code with real-time biometric face vector.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono text-muted-foreground bg-background/60 px-3 py-1.5 rounded-xl border border-border">
+                    Auto-ready in {autoResetSeconds}s
+                  </span>
                   <button
                     type="button"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      handleCancelCycle()
+                    onClick={() => {
+                      setPhase('idle')
+                      setTriggerStatus({ active: false, triggered_at: null })
+                      setResult(null)
                     }}
-                    className="text-[11px] underline text-muted-foreground hover:text-foreground cursor-pointer"
+                    className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-1.5 text-xs font-semibold transition-colors cursor-pointer"
                   >
-                    Done / Ready for Next
+                    Ready for Next Student
                   </button>
                 </div>
-                {result.marked ? (
-                  <>
-                    <p>
-                      <span className="font-semibold">Student:</span> {result.name} ({result.code})
-                    </p>
-                    <p>
-                      <span className="font-semibold">Confidence:</span>{' '}
-                      {result.similarity ? (result.similarity * 100).toFixed(1) : 0}% (Cosine threshold &ge; 40%)
-                    </p>
-                    <p className="text-[11px] opacity-80">
-                      Outcome dispatched to ESP32 LCD. Camera stopped. Ready for next student arrival.
-                    </p>
-                  </>
-                ) : (
-                  <p>
-                    <span className="font-semibold">Reason:</span>{' '}
-                    {result.reason || 'Face embedding did not match decoded QR identity.'}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
+                <div className="rounded-xl bg-background/50 p-3 border border-border/60">
+                  <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider block">
+                    Student Name
+                  </span>
+                  <span className="text-sm font-bold text-foreground mt-0.5 block">{result.name}</span>
+                </div>
+
+                <div className="rounded-xl bg-background/50 p-3 border border-border/60">
+                  <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider block">
+                    Student Code
+                  </span>
+                  <span className="text-sm font-mono font-bold text-foreground mt-0.5 block">{result.code}</span>
+                </div>
+
+                <div className="rounded-xl bg-background/50 p-3 border border-border/60">
+                  <span className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider block">
+                    Cosine Match Score
+                  </span>
+                  <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400 mt-0.5 block">
+                    {(result.similarity * 100).toFixed(1)}% match
+                  </span>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-muted-foreground pt-1">
+                Outcome dispatched to ESP32 LCD & buzzer: &ldquo;{result.name} Present&rdquo;.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* ERROR VIEW: Verification Incomplete or Failure */}
+        {phase === 'error' && (
+          <div className="p-6 animate-in zoom-in-95 duration-200">
+            <div className="rounded-2xl border border-rose-500/40 bg-rose-500/10 p-6 text-rose-950 dark:text-rose-200 space-y-4">
+              <div className="flex items-start gap-3.5">
+                <div className="size-12 rounded-2xl bg-rose-500 text-white flex items-center justify-center shrink-0 shadow-lg shadow-rose-500/30">
+                  <XCircle className="size-7" />
+                </div>
+                <div className="space-y-1">
+                  <h3 className="text-base font-bold text-rose-700 dark:text-rose-300">
+                    Verification Incomplete
+                  </h3>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    {errorMessage || 'Unable to cross-validate student identity. Please ensure ID card is held steady and your face is well-lit.'}
                   </p>
-                )}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 pt-2 border-t border-rose-500/20">
+                <button
+                  type="button"
+                  onClick={() => runAttendanceCycle()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 text-xs font-semibold transition-colors cursor-pointer shadow-sm"
+                >
+                  <RefreshCw className="size-3.5" />
+                  Retry Scan Now
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCancelCycle}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-border bg-background hover:bg-muted px-4 py-2 text-xs font-semibold text-foreground transition-colors cursor-pointer"
+                >
+                  Cancel / Return to Idle
+                </button>
               </div>
             </div>
           </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/* =========================================================================
-   HARDWARE DEVICE CONTROLLER LIVE STATUS (ESP32 Serial + Liveness Feed)
-   ========================================================================= */
-function HardwareDeviceLiveCard({
-  onRecordAdded,
-  onError,
-  onSuccess,
-}: {
-  onRecordAdded: (r: AttendanceRecord) => void
-  onError: (msg: string) => void
-  onSuccess?: (msg: string) => void
-}) {
-  const [deviceState, setDeviceState] = useState<DeviceState>({
-    state: 'idle',
-    detail: 'Waiting for student to approach ESP32 ultrasonic sensor...',
-    timestamp: Date.now() / 1000,
-  })
-  const [wsConnected, setWsConnected] = useState(false)
-  const [triggering, setTriggering] = useState(false)
-  const lastRecordedTimestamp = useRef<number>(0)
-
-  useEffect(() => {
-    let ws: WebSocket | null = null
-    let pollInterval: any = null
-    let isMounted = true
-
-    const connectWebSocket = () => {
-      try {
-        const url = api.getDeviceWsUrl()
-        ws = new WebSocket(url)
-
-        ws.onopen = () => {
-          if (isMounted) setWsConnected(true)
-        }
-
-        ws.onmessage = (event) => {
-          try {
-            const data: DeviceState = JSON.parse(event.data)
-            if (isMounted) {
-              setDeviceState(data)
-              if (
-                data.state === 'result_ok' &&
-                data.student_name &&
-                data.student_code &&
-                data.timestamp !== lastRecordedTimestamp.current
-              ) {
-                lastRecordedTimestamp.current = data.timestamp
-                onRecordAdded({
-                  name: data.student_name,
-                  code: data.student_code,
-                  similarity: data.similarity || 1.0,
-                  timestamp: new Date(data.timestamp * 1000).toISOString(),
-                })
-                onSuccess?.(`Attendance verified for ${data.student_name} (${data.student_code})!`)
-              }
-            }
-          } catch {}
-        }
-
-        ws.onclose = () => {
-          if (isMounted) setWsConnected(false)
-          setTimeout(() => {
-            if (isMounted) connectWebSocket()
-          }, 2000)
-        }
-
-        ws.onerror = () => {
-          if (isMounted) setWsConnected(false)
-        }
-      } catch {
-        if (isMounted) setWsConnected(false)
-      }
-    }
-
-    connectWebSocket()
-
-    pollInterval = setInterval(async () => {
-      try {
-        const latest = await api.latestResult()
-        if (isMounted && latest) {
-          if (latest.phase === 'scanning_qr') {
-            setDeviceState({
-              state: 'scan_qr',
-              detail: 'ESP32 LCD: Scan your ID card QR code...',
-              timestamp: Date.now() / 1000,
-            })
-            return
-          } else if (latest.phase === 'blink') {
-            setDeviceState({
-              state: 'blink',
-              detail: 'ESP32 LCD: Look at camera and blink now',
-              timestamp: Date.now() / 1000,
-            })
-            return
-          } else if (latest.phase === 'processing') {
-            setDeviceState({
-              state: 'processing',
-              detail: 'ESP32 LCD: Verifying... Please wait',
-              timestamp: Date.now() / 1000,
-            })
-            return
-          } else if (latest.available || latest.phase === 'done') {
-            if (latest.marked && latest.name && latest.code) {
-              const ts = latest.timestamp ? new Date(latest.timestamp).getTime() / 1000 : Date.now() / 1000
-              if (ts !== lastRecordedTimestamp.current) {
-                lastRecordedTimestamp.current = ts
-                setDeviceState({
-                  state: 'result_ok',
-                  student_name: latest.name,
-                  student_code: latest.code,
-                  similarity: latest.similarity || 1.0,
-                  detail: 'Attendance verified and logged',
-                  timestamp: ts,
-                })
-                onRecordAdded({
-                  name: latest.name,
-                  code: latest.code,
-                  similarity: latest.similarity || 1.0,
-                  timestamp: latest.timestamp || new Date().toISOString(),
-                })
-                onSuccess?.(`Attendance verified for ${latest.name} (${latest.code})!`)
-              }
-              return
-            } else if (latest.marked === false) {
-              setDeviceState({
-                state: 'result_fail',
-                detail: latest.reason || 'Verification mismatch or low confidence',
-                timestamp: Date.now() / 1000,
-              })
-              return
-            }
-          }
-        }
-      } catch {}
-
-      if (!wsConnected) {
-        try {
-          const st = await api.getDeviceState()
-          if (isMounted && st) {
-            setDeviceState(st)
-            if (
-              st.state === 'result_ok' &&
-              st.student_name &&
-              st.student_code &&
-              st.timestamp !== lastRecordedTimestamp.current
-            ) {
-              lastRecordedTimestamp.current = st.timestamp
-              onRecordAdded({
-                name: st.student_name,
-                code: st.student_code,
-                similarity: st.similarity || 1.0,
-                timestamp: new Date(st.timestamp * 1000).toISOString(),
-              })
-              onSuccess?.(`Attendance verified for ${st.student_name} (${st.student_code})!`)
-            }
-          }
-        } catch {}
-      }
-    }, 1000)
-
-    return () => {
-      isMounted = false
-      if (ws) ws.close()
-      if (pollInterval) clearInterval(pollInterval)
-    }
-  }, [onRecordAdded, onSuccess, wsConnected])
-
-  const handleManualTrigger = async () => {
-    setTriggering(true)
-    try {
-      await api.trigger()
-      onSuccess?.('ESP32 Proximity Trigger simulated! Hardware cycle started.')
-    } catch (e: any) {
-      onError(e.message || 'Failed to trigger device cycle')
-    } finally {
-      setTriggering(false)
-    }
-  }
-
-  const stateConfig = {
-    idle: {
-      label: 'Idle — waiting for someone to approach',
-      desc: 'ESP32 ultrasonic proximity sensor is active. Come within 30cm of the sensor.',
-      badge: 'Listening (Ultrasonic)',
-      badgeColor: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30',
-      icon: Radio,
-      containerBg: 'border-border bg-card/70 shadow-sm',
-      pulse: false,
-    },
-    scan_qr: {
-      label: 'Scanning QR code...',
-      desc: 'Webcam active. Position student ID card QR code in front of camera.',
-      badge: 'Step 1/3: QR Scan',
-      badgeColor: 'bg-amber-500/20 text-amber-600 dark:text-amber-400 border-amber-500/40 animate-pulse',
-      icon: QrCode,
-      containerBg: 'border-amber-500/50 bg-amber-500/5 ring-1 ring-amber-500/20 shadow-md',
-      pulse: true,
-    },
-    blink: {
-      label: 'Checking liveness — please blink',
-      desc: 'MediaPipe FaceMesh is tracking Eye Aspect Ratio (EAR). Blink naturally at the camera.',
-      badge: 'Step 2/3: Liveness Check',
-      badgeColor: 'bg-sky-500/20 text-sky-600 dark:text-sky-400 border-sky-500/40 animate-pulse',
-      icon: Eye,
-      containerBg: 'border-sky-500/50 bg-sky-500/5 ring-1 ring-sky-500/20 shadow-md',
-      pulse: true,
-    },
-    processing: {
-      label: 'Verifying...',
-      desc: 'Extracting ArcFace 512-d embedding & querying ChromaDB for identity match.',
-      badge: 'Step 3/3: Biometric Match',
-      badgeColor: 'bg-indigo-500/20 text-indigo-600 dark:text-indigo-400 border-indigo-500/40 animate-pulse',
-      icon: RefreshCw,
-      containerBg: 'border-indigo-500/50 bg-indigo-500/5 ring-1 ring-indigo-500/20 shadow-md',
-      pulse: true,
-    },
-    result_ok: {
-      label: `✅ Marked: ${deviceState.student_name || 'Student'}`,
-      desc: `ID: ${deviceState.student_code || '—'} • ${
-        deviceState.similarity ? `${(deviceState.similarity * 100).toFixed(1)}% match` : 'Matched'
-      } • ESP32 green LED signaled.`,
-      badge: 'Attendance Verified',
-      badgeColor: 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border-emerald-500/40',
-      icon: CheckCircle2,
-      containerBg: 'border-emerald-500/60 bg-emerald-500/10 ring-2 ring-emerald-500/20 shadow-lg',
-      pulse: false,
-    },
-    result_fail: {
-      label: `❌ Not verified: ${deviceState.detail}`,
-      desc: 'ESP32 red LED & buzzer error tone signaled. Cycle restarting shortly.',
-      badge: 'Verification Failed',
-      badgeColor: 'bg-rose-500/20 text-rose-600 dark:text-rose-400 border-rose-500/40',
-      icon: XCircle,
-      containerBg: 'border-rose-500/60 bg-rose-500/10 ring-2 ring-rose-500/20 shadow-lg',
-      pulse: false,
-    },
-  }
-
-  const currentConfig = stateConfig[deviceState.state] || stateConfig.idle
-  const StatusIcon = currentConfig.icon
-
-  return (
-    <div className={`rounded-2xl border p-5 transition-all duration-300 ${currentConfig.containerBg}`}>
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div className="flex items-start sm:items-center gap-3.5">
-          <div
-            className={`flex size-12 shrink-0 items-center justify-center rounded-xl transition-all ${
-              currentConfig.pulse
-                ? 'bg-amber-500 text-black shadow-md shadow-amber-500/40 animate-pulse'
-                : deviceState.state === 'result_ok'
-                ? 'bg-emerald-500 text-white shadow-md shadow-emerald-500/30'
-                : deviceState.state === 'result_fail'
-                ? 'bg-rose-500 text-white shadow-md shadow-rose-500/30'
-                : 'bg-muted text-muted-foreground'
-            }`}
-          >
-            <StatusIcon className={`size-6 ${deviceState.state === 'processing' ? 'animate-spin' : ''}`} />
-          </div>
-
-          <div>
-            <div className="flex flex-wrap items-center gap-2">
-              <h3 className="text-base font-bold tracking-tight text-foreground">{currentConfig.label}</h3>
-              <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${currentConfig.badgeColor}`}>
-                <span className={`size-1.5 rounded-full ${currentConfig.pulse ? 'bg-amber-500 animate-ping' : 'bg-current'}`} />
-                {currentConfig.badge}
-              </span>
-              <span
-                className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full font-medium border ${
-                  wsConnected
-                    ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
-                    : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30'
-                }`}
-                title={wsConnected ? 'WebSocket live streaming active' : 'WebSocket disconnected, using polling'}
-              >
-                <span className={`size-1 rounded-full ${wsConnected ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-                {wsConnected ? 'WS Live' : 'Polling'}
-              </span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-1">{currentConfig.desc}</p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2 self-end sm:self-center">
-          <button
-            type="button"
-            onClick={handleManualTrigger}
-            disabled={triggering || deviceState.state !== 'idle'}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-border bg-background/80 hover:bg-muted px-3.5 py-2 text-xs font-semibold text-foreground shadow-sm transition-all disabled:opacity-50 cursor-pointer"
-            title="Simulate someone approaching the ESP32 sensor to demonstrate the live flow"
-          >
-            <Cpu className="size-3.5 text-amber-500" />
-            {triggering ? 'Triggering...' : 'Simulate Approach'}
-          </button>
-        </div>
+        )}
       </div>
     </div>
   )
 }
 
 /* =========================================================================
-   2. LIVE ATTENDANCE STATION (Camera + QR + Face Verification + Real-time Feed)
+   2. LIVE ATTENDANCE SECTION (Hardware Station + Real-time Logs Feed)
    ========================================================================= */
 function LiveAttendanceSection({
   recentRecords,
@@ -1476,154 +1411,9 @@ function LiveAttendanceSection({
   onError: (msg: string) => void
   onSuccess?: (msg: string) => void
 }) {
-  const [cameraActive, setCameraActive] = useState(false)
-  const [qrCodeInput, setQrCodeInput] = useState('')
-  const [qrImageFile, setQrImageFile] = useState<File | null>(null)
-  const [qrDecoding, setQrDecoding] = useState(false)
-  const [processing, setProcessing] = useState(false)
-  const [lastResult, setLastResult] = useState<MarkAttendanceResult | null>(null)
-  const [faceImageFile, setFaceImageFile] = useState<File | null>(null)
-  const [facePreview, setFacePreview] = useState<string | null>(null)
-
-  const videoRef = useRef<HTMLVideoElement | null>(null)
-  const streamRef = useRef<MediaStream | null>(null)
-
-  // Start Camera
-  const startCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-      })
-      streamRef.current = stream
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-      }
-      setCameraActive(true)
-    } catch (err: any) {
-      onError('Unable to access webcam: ' + (err.message || 'Permission denied'))
-    }
-  }
-
-  // Stop Camera
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop())
-      streamRef.current = null
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null
-    }
-    setCameraActive(false)
-  }
-
-  useEffect(() => {
-    return () => {
-      stopCamera()
-    }
-  }, [])
-
-  // Capture frame as Blob
-  const captureFrame = async (): Promise<Blob | null> => {
-    if (!videoRef.current) return null
-    const video = videoRef.current
-    const canvas = document.createElement('canvas')
-    canvas.width = video.videoWidth || 640
-    canvas.height = video.videoHeight || 480
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return null
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-    setFacePreview(canvas.toDataURL('image/jpeg'))
-
-    return new Promise((resolve) => {
-      canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.95)
-    })
-  }
-
-  // Handle uploaded QR image and auto-decode
-  const handleQRUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setQrImageFile(file)
-    setQrDecoding(true)
-    try {
-      const res = await api.qrDecode(file)
-      if (res.data) {
-        setQrCodeInput(res.data.trim().toUpperCase())
-      }
-    } catch (err: any) {
-      onError('QR Code Decode failed: ' + (err.message || 'No QR code found in photo'))
-    } finally {
-      setQrDecoding(false)
-    }
-  }
-
-  // Handle uploaded face image
-  const handleFaceUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setFaceImageFile(file)
-    setFacePreview(URL.createObjectURL(file))
-  }
-
-  // Action: Mark Attendance
-  const handleVerify = async () => {
-    let codeToVerify = qrCodeInput.trim()
-
-    // If QR code isn't typed yet, but user uploaded a QR file, decode it first
-    if (!codeToVerify && qrImageFile) {
-      setQrDecoding(true)
-      try {
-        const decoded = await api.qrDecode(qrImageFile)
-        codeToVerify = decoded.data.trim().toUpperCase()
-        setQrCodeInput(codeToVerify)
-      } catch (err: any) {
-        onError('Could not extract QR code: ' + err.message)
-        setQrDecoding(false)
-        return
-      } finally {
-        setQrDecoding(false)
-      }
-    }
-
-    if (!codeToVerify) {
-      onError('Please provide a Student QR Code (type ID, scan QR code image, or upload QR).')
-      return
-    }
-
-    setProcessing(true)
-    setLastResult(null)
-
-    try {
-      let faceBlob: Blob | File | undefined = faceImageFile || undefined
-      if (!faceBlob && cameraActive) {
-        faceBlob = (await captureFrame()) || undefined
-      }
-
-      if (!faceBlob) {
-        throw new Error('Please start the camera or upload a face image to verify.')
-      }
-
-      const res = await api.markAttendance(codeToVerify, faceBlob)
-      setLastResult(res)
-
-      if (res.marked && res.name && res.code) {
-        onRecordAdded({
-          code: res.code,
-          name: res.name,
-          similarity: res.similarity,
-          timestamp: res.timestamp || new Date().toISOString(),
-        })
-      }
-    } catch (e: any) {
-      onError(e.message || 'Failed to verify attendance')
-    } finally {
-      setProcessing(false)
-    }
-  }
-
   return (
     <div className="space-y-6">
-      {/* Top Banner / Explainer */}
+      {/* Top Banner Explainer */}
       <div className="rounded-2xl border border-primary/20 bg-primary/5 p-4 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground">
@@ -1632,219 +1422,20 @@ function LiveAttendanceSection({
           <div>
             <h2 className="text-sm font-bold">Two-Factor Cross-Validation Station</h2>
             <p className="text-xs text-muted-foreground">
-              1. Reads Student Code from QR or ID tag &bull; 2. Computes Face ArcFace vector &bull; 3. If matched (&ge; 40% cosine confidence), logs attendance to SQLite.
+              1. Reads Student Code from QR &bull; 2. Computes Face ArcFace vector &bull; 3. If matched (&ge; 40% confidence), logs attendance to SQLite.
             </p>
           </div>
         </div>
       </div>
 
-      {/* Real-time Hardware Device Controller Status Card */}
-      <HardwareDeviceLiveCard
+      {/* Unified Live Attendance Station */}
+      <LiveAttendanceStation
         onRecordAdded={onRecordAdded}
         onError={onError}
-        onSuccess={onSuccess}
+        onSuccess={onSuccess || (() => {})}
       />
 
-      {/* ESP32 Hardware Trigger Bridge & Single-Image Auto Capture */}
-      <Esp32TriggerBridge
-        onRecordAdded={onRecordAdded}
-        onError={onError}
-        onSuccess={onSuccess || ((m) => {})}
-      />
-
-      <div className="grid gap-6 lg:grid-cols-12">
-        {/* Left: Video & Face Capture */}
-        <div className="lg:col-span-7 space-y-4">
-          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm overflow-hidden flex flex-col">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <Camera className="size-4 text-primary" />
-                <h3 className="font-bold text-sm">Step 1: Face Capture</h3>
-              </div>
-              <button
-                onClick={cameraActive ? stopCamera : startCamera}
-                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
-                  cameraActive
-                    ? 'bg-rose-500/10 text-rose-600 hover:bg-rose-500/20'
-                    : 'bg-primary text-primary-foreground hover:bg-primary/90'
-                }`}
-              >
-                {cameraActive ? <VideoOff className="size-3.5" /> : <Video className="size-3.5" />}
-                {cameraActive ? 'Stop Camera' : 'Start Camera'}
-              </button>
-            </div>
-
-            {/* Viewport */}
-            <div className="relative aspect-video w-full rounded-xl bg-muted/60 border border-border overflow-hidden flex items-center justify-center">
-              {cameraActive ? (
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className="w-full h-full object-cover mirror"
-                />
-              ) : facePreview ? (
-                <img src={facePreview} alt="Captured face" className="w-full h-full object-cover" />
-              ) : (
-                <div className="flex flex-col items-center text-center p-6 text-muted-foreground">
-                  <Video className="size-10 mb-2 opacity-30" />
-                  <p className="text-sm font-medium">Webcam inactive</p>
-                  <p className="text-xs mt-1 max-w-xs">
-                    Start your camera or upload a student face image below.
-                  </p>
-                </div>
-              )}
-
-              {cameraActive && (
-                <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                  <div className="size-48 rounded-2xl border-2 border-dashed border-primary/80 animate-pulse" />
-                </div>
-              )}
-            </div>
-
-            {/* Fallback Face Upload */}
-            <div className="mt-4 flex items-center justify-between pt-3 border-t border-border">
-              <label className="cursor-pointer inline-flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground font-medium">
-                <Upload className="size-3.5" /> Or choose face photo from disk
-                <input type="file" accept="image/*" className="hidden" onChange={handleFaceUpload} />
-              </label>
-
-              {facePreview && !cameraActive && (
-                <button
-                  onClick={() => {
-                    setFacePreview(null)
-                    setFaceImageFile(null)
-                  }}
-                  className="text-xs text-rose-500 hover:underline"
-                >
-                  Clear image
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* Right: QR Code Input & Verify Button */}
-        <div className="lg:col-span-5 space-y-4">
-          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm flex flex-col gap-4">
-            <div>
-              <h3 className="font-bold text-base">Step 2: Student QR / ID Code</h3>
-              <p className="text-xs text-muted-foreground mt-1">
-                Scan/upload student QR code or type student ID code directly.
-              </p>
-            </div>
-
-            <div className="space-y-3">
-              {/* QR Upload helper */}
-              <div className="rounded-xl border border-dashed border-border p-3 bg-muted/20">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold flex items-center gap-1.5">
-                    <QrCode className="size-3.5 text-primary" /> Auto-Decode QR Image
-                  </span>
-                  <label className="cursor-pointer text-xs font-semibold text-primary hover:underline flex items-center gap-1">
-                    <Upload className="size-3" /> Select QR file
-                    <input type="file" accept="image/*" className="hidden" onChange={handleQRUpload} />
-                  </label>
-                </div>
-                {qrDecoding && (
-                  <p className="text-[11px] text-muted-foreground mt-2 flex items-center gap-1.5">
-                    <RefreshCw className="size-3 animate-spin text-primary" /> Decoding QR via backend OpenCV...
-                  </p>
-                )}
-                {qrImageFile && !qrDecoding && (
-                  <p className="text-[11px] text-emerald-600 dark:text-emerald-400 mt-1.5 font-medium truncate">
-                    Loaded QR: {qrImageFile.name}
-                  </p>
-                )}
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
-                  Student Code Value
-                </label>
-                <div className="relative">
-                  <QrCode className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
-                  <input
-                    type="text"
-                    value={qrCodeInput}
-                    onChange={(e) => setQrCodeInput(e.target.value.toUpperCase())}
-                    placeholder="e.g. CS-2041 or 101"
-                    className="w-full rounded-xl border border-input bg-background pl-9 pr-3 py-2.5 text-sm font-mono uppercase focus:ring-2 focus:ring-primary outline-none"
-                  />
-                </div>
-              </div>
-
-              <button
-                onClick={handleVerify}
-                disabled={processing || qrDecoding}
-                className="w-full rounded-xl bg-primary text-primary-foreground py-3 px-4 font-semibold text-sm shadow hover:bg-primary/90 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
-              >
-                {processing ? (
-                  <>
-                    <RefreshCw className="size-4 animate-spin" /> Verifying Face & QR...
-                  </>
-                ) : (
-                  <>
-                    <CheckCircle2 className="size-4" /> Match & Mark Attendance
-                  </>
-                )}
-              </button>
-            </div>
-
-            {/* Verification Result Display */}
-            {lastResult && (
-              <div
-                className={`rounded-xl p-4 border transition-all ${
-                  lastResult.marked
-                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-950 dark:text-emerald-200'
-                    : 'bg-rose-500/10 border-rose-500/30 text-rose-950 dark:text-rose-200'
-                }`}
-              >
-                <div className="flex items-start gap-3">
-                  {lastResult.marked ? (
-                    <CheckCircle2 className="size-5 text-emerald-500 shrink-0 mt-0.5" />
-                  ) : (
-                    <XCircle className="size-5 text-rose-500 shrink-0 mt-0.5" />
-                  )}
-                  <div className="text-xs space-y-1">
-                    <p className="font-bold text-sm">
-                      {lastResult.marked ? 'Attendance Verified & Logged!' : 'Verification Failed'}
-                    </p>
-                    {lastResult.marked ? (
-                      <>
-                        <p>
-                          <span className="font-semibold">Student:</span> {lastResult.name} ({lastResult.code})
-                        </p>
-                        <p>
-                          <span className="font-semibold">Cosine Confidence:</span>{' '}
-                          {(lastResult.similarity * 100).toFixed(1)}% (Threshold &ge; 40%)
-                        </p>
-                        <p className="text-[11px] opacity-80">{formatTime(lastResult.timestamp)}</p>
-                      </>
-                    ) : (
-                      <>
-                        <p>
-                          <span className="font-semibold">Reason:</span> {lastResult.reason || 'Mismatch or low confidence'}
-                        </p>
-                        <p>
-                          <span className="font-semibold">QR Code:</span> {lastResult.qr_code || '—'}
-                        </p>
-                        <p>
-                          <span className="font-semibold">Face Vector Matched To:</span>{' '}
-                          {lastResult.face_predicted || 'No face match in DB'} ({(lastResult.similarity * 100).toFixed(1)}%)
-                        </p>
-                      </>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Live Stream Attendance Logs Feed */}
+      {/* Real-time Attendance Stream Logs Table */}
       <div className="rounded-2xl border border-border bg-card p-5 shadow-sm space-y-4">
         <div className="flex items-center justify-between border-b border-border pb-3">
           <div className="flex items-center gap-2">
@@ -1857,7 +1448,7 @@ function LiveAttendanceSection({
         {recentRecords.length === 0 ? (
           <div className="py-8 text-center text-sm text-muted-foreground">
             <ClipboardList className="size-8 mx-auto mb-2 opacity-30" />
-            No scans recorded yet. Match student face + QR code above to see live updates.
+            No scans recorded yet. Stand in front of the ESP32 ultrasonic sensor to mark attendance.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -1902,6 +1493,7 @@ function LiveAttendanceSection({
     </div>
   )
 }
+
 
 /* =========================================================================
    3. ENROLLMENT SECTION (Multiple Photos per Student)

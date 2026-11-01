@@ -170,7 +170,7 @@ requires-dist = [
     { name = "chromadb", specifier = ">=1.5.9" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "insightface", specifier = ">=1.0.1" },
-    { name = "mediapipe", specifier = ">=0.10.14" },
+    { name = "mediapipe", specifier = "==1.0.1" },
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "onnxruntime", specifier = ">=1.29.0" },
     { name = "opencv-python-headless", specifier = ">=5.0.0.93" },
