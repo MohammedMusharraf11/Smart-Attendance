@@ -307,3 +307,4 @@ def _dispatch_smtp(config: Dict[str, Any], recipient: str, msg: MIMEMultipart):
     except Exception as exc:
         logger.error(f"Failed to deliver email via SMTP: {exc}")
         raise RuntimeError(f"SMTP error ({host}:{port}): {str(exc)}")
+

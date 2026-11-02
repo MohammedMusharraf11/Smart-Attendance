@@ -34,3 +34,4 @@ echo   Double-click start_kiosk.bat to launch the updated system.
 echo ============================================================
 echo.
 pause
+
