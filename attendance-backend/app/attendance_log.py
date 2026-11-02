@@ -1,4 +1,5 @@
 """SQLite-backed attendance log and academic session manager."""
+import os
 import sqlite3
 from datetime import datetime, time, timezone
 from pathlib import Path
@@ -8,6 +9,28 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(DATA_DIR / "attendance.db")
+
+
+def load_env_file():
+    """Auto-loads key-value pairs from .env if present (no extra pip package needed)."""
+    for candidate in [BASE_DIR / ".env", BASE_DIR.parent / ".env"]:
+        if candidate.is_file():
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+
+load_env_file()
 
 
 def get_connection():
@@ -80,17 +103,31 @@ def init_db():
         """
     )
 
-    # Ensure single row exists for email_settings
+    # Ensure email_settings row exists and has default working credentials
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM email_settings WHERE id = 1")
-    if not cursor.fetchone():
-        now_iso = datetime.now(timezone.utc).isoformat()
+    cursor.execute("SELECT id, smtp_user, smtp_password FROM email_settings WHERE id = 1")
+    row = cursor.fetchone()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    default_user = os.environ.get("SMTP_USER", "rljitsmartattendance@gmail.com").strip()
+    default_pass = os.environ.get("SMTP_PASSWORD", "zlfr lnnp rqws usze").strip()
+    default_name = os.environ.get("SMTP_SENDER_NAME", "RLJIT Smart Attendance").strip()
+
+    if not row:
         conn.execute(
             """
             INSERT INTO email_settings (id, smtp_host, smtp_port, smtp_user, smtp_password, sender_name, updated_at)
-            VALUES (1, 'smtp.gmail.com', 587, '', '', 'Smart Attendance Kiosk', ?)
+            VALUES (1, 'smtp.gmail.com', 587, ?, ?, ?, ?)
             """,
-            (now_iso,),
+            (default_user, default_pass, default_name, now_iso),
+        )
+    elif not row["smtp_user"] or not row["smtp_password"]:
+        conn.execute(
+            """
+            UPDATE email_settings
+            SET smtp_user = ?, smtp_password = ?, sender_name = ?, updated_at = ?
+            WHERE id = 1
+            """,
+            (default_user, default_pass, default_name, now_iso),
         )
 
     conn.commit()
