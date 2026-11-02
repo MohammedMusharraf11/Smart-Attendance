@@ -11,10 +11,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from app.attendance_log import init_db, mark_attendance, get_recent_attendance
+from app.attendance_log import (
+    init_db,
+    mark_attendance,
+    get_recent_attendance,
+    get_teachers,
+    add_teacher,
+    delete_teacher,
+    get_sessions,
+    add_session,
+    delete_session,
+    get_session,
+    get_active_session,
+    calculate_session_attendance,
+    get_email_settings,
+    save_email_settings,
+)
 from app.db import delete_student, enroll_embedding, list_students, query_best_match
 from app.device_controller import device_controller
 from app.liveness import check_blink
+from app.mailer import send_attendance_report, send_test_email
 from app.model import get_embedding, get_model
 from app.qr import decode_qr
 
@@ -395,6 +411,145 @@ async def mark_attendance_single_endpoint(image: UploadFile = File(...)):
 def get_recent_attendance_records(limit: int = 50):
     """List recent attendance logs from SQLite."""
     return {"records": get_recent_attendance(limit=limit)}
+
+
+# -------------------------------------------------------------------------
+# TEACHER DIRECTORY
+# -------------------------------------------------------------------------
+@app.get("/teachers")
+def list_teachers_endpoint():
+    return {"teachers": get_teachers()}
+
+
+@app.post("/teachers")
+def create_teacher_endpoint(payload: dict):
+    name = payload.get("name", "").strip()
+    email = payload.get("email", "").strip()
+    subject = payload.get("subject", "").strip()
+    department = payload.get("department", "").strip()
+    if not name or not email:
+        raise HTTPException(400, "Name and Email are required fields.")
+    return add_teacher(name, email, subject, department)
+
+
+@app.delete("/teachers/{teacher_id}")
+def delete_teacher_endpoint(teacher_id: int):
+    success = delete_teacher(teacher_id)
+    if not success:
+        raise HTTPException(404, "Teacher not found")
+    return {"status": "deleted", "id": teacher_id}
+
+
+# -------------------------------------------------------------------------
+# CLASS SESSIONS & TIMETABLE
+# -------------------------------------------------------------------------
+@app.get("/sessions")
+def list_sessions_endpoint():
+    return {"sessions": get_sessions()}
+
+
+@app.post("/sessions")
+def create_session_endpoint(payload: dict):
+    subject_name = payload.get("subject_name", "").strip()
+    teacher_name = payload.get("teacher_name", "").strip()
+    teacher_email = payload.get("teacher_email", "").strip()
+    session_date = payload.get("session_date", "").strip()
+    start_time = payload.get("start_time", "").strip()
+    end_time = payload.get("end_time", "").strip()
+    cutoff_minutes = int(payload.get("cutoff_minutes", 30))
+
+    if not subject_name or not teacher_email or not session_date or not start_time:
+        raise HTTPException(400, "Subject name, teacher email, date, and start time are required.")
+
+    return add_session(
+        subject_name=subject_name,
+        teacher_name=teacher_name,
+        teacher_email=teacher_email,
+        session_date=session_date,
+        start_time=start_time,
+        end_time=end_time or start_time,
+        cutoff_minutes=cutoff_minutes,
+    )
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session_endpoint(session_id: int):
+    success = delete_session(session_id)
+    if not success:
+        raise HTTPException(404, "Session not found")
+    return {"status": "deleted", "id": session_id}
+
+
+@app.get("/sessions/active")
+def get_active_session_endpoint():
+    return {"session": get_active_session()}
+
+
+@app.get("/sessions/{session_id}/report")
+def get_session_report_endpoint(session_id: int):
+    try:
+        enrolled = list_students()
+        return calculate_session_attendance(session_id, enrolled)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/sessions/{session_id}/send-email")
+def send_session_email_endpoint(session_id: int):
+    try:
+        enrolled = list_students()
+        res = send_attendance_report(session_id, enrolled)
+        return res
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to send email: {str(exc)}")
+
+
+# -------------------------------------------------------------------------
+# EMAIL / SMTP SETTINGS
+# -------------------------------------------------------------------------
+@app.get("/settings/email")
+def get_email_settings_endpoint():
+    settings = get_email_settings()
+    has_pwd = bool(settings.get("smtp_password"))
+    masked = dict(settings)
+    masked["has_password"] = has_pwd
+    if has_pwd:
+        masked["smtp_password"] = "••••••••••••"
+    return {"settings": masked}
+
+
+@app.post("/settings/email")
+def update_email_settings_endpoint(payload: dict):
+    current = get_email_settings()
+    host = payload.get("smtp_host", current["smtp_host"])
+    port = int(payload.get("smtp_port", current["smtp_port"]))
+    user = payload.get("smtp_user", current["smtp_user"])
+    password = payload.get("smtp_password", "")
+    if not password or password == "••••••••••••":
+        password = current.get("smtp_password", "")
+    sender_name = payload.get("sender_name", current["sender_name"])
+
+    saved = save_email_settings(
+        smtp_host=host,
+        smtp_port=port,
+        smtp_user=user,
+        smtp_password=password,
+        sender_name=sender_name,
+    )
+    return {"status": "saved", "settings": saved}
+
+
+@app.post("/settings/email/test")
+def test_email_endpoint(payload: dict):
+    recipient = payload.get("recipient", "").strip()
+    if not recipient:
+        raise HTTPException(400, "Recipient email is required.")
+    try:
+        return send_test_email(recipient)
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
 
 
 # Mount Next.js static export if built (runs entire system on port 8000 without Node.js)

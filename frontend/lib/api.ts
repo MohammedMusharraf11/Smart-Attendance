@@ -48,6 +48,65 @@ export type MarkAttendanceResult = {
   liveness?: LivenessResult
 }
 
+export type Teacher = {
+  id: number
+  name: string
+  email: string
+  subject?: string
+  department?: string
+  created_at?: string
+}
+
+export type ClassSession = {
+  id: number
+  subject_name: string
+  teacher_name: string
+  teacher_email: string
+  session_date: string
+  start_time: string
+  end_time: string
+  cutoff_minutes: number
+  status: string
+  email_sent: number
+  email_sent_at?: string
+  created_at?: string
+  is_within_cutoff?: boolean
+  cutoff_time?: string
+}
+
+export type SessionReport = {
+  session: ClassSession
+  summary: {
+    total_enrolled: number
+    present_count: number
+    absent_count: number
+    attendance_percentage: number
+    cutoff_minutes: number
+  }
+  present: Array<{
+    code: string
+    name: string
+    similarity: number
+    time_in: string
+    timestamp: string
+  }>
+  absent: Array<{
+    code: string
+    name: string
+    status: string
+  }>
+}
+
+export type EmailSettings = {
+  smtp_host: string
+  smtp_port: number
+  smtp_user: string
+  smtp_password?: string
+  sender_name: string
+  updated_at?: string
+  has_password?: boolean
+}
+
 export type HealthStatus = {
   status: string
 }
@@ -228,6 +287,79 @@ export const api = {
     const host = baseUrl.replace(/^https?:\/\//, '')
     return `${wsProto}//${host}/ws/device-state`
   },
+
+  // Teachers API
+  teachers: async (): Promise<Teacher[]> => {
+    const data = await request<{ teachers: Teacher[] }>('/teachers')
+    return data.teachers || []
+  },
+
+  addTeacher: (teacher: Partial<Teacher>) =>
+    request<Teacher>('/teachers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(teacher),
+    }),
+
+  deleteTeacher: (id: number) =>
+    request<{ status: string; id: number }>(`/teachers/${id}`, {
+      method: 'DELETE',
+    }),
+
+  // Class Sessions & Scheduling API
+  sessions: async (): Promise<ClassSession[]> => {
+    const data = await request<{ sessions: ClassSession[] }>('/sessions')
+    return data.sessions || []
+  },
+
+  addSession: (session: Partial<ClassSession>) =>
+    request<ClassSession>('/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(session),
+    }),
+
+  deleteSession: (id: number) =>
+    request<{ status: string; id: number }>(`/sessions/${id}`, {
+      method: 'DELETE',
+    }),
+
+  activeSession: async (): Promise<ClassSession | null> => {
+    try {
+      const data = await request<{ session: ClassSession | null }>('/sessions/active')
+      return data.session
+    } catch {
+      return null
+    }
+  },
+
+  sessionReport: (sessionId: number): Promise<SessionReport> =>
+    request<SessionReport>(`/sessions/${sessionId}/report`),
+
+  sendSessionEmail: (sessionId: number) =>
+    request<{ status: string; recipient: string; subject: string }>(`/sessions/${sessionId}/send-email`, {
+      method: 'POST',
+    }),
+
+  // Email / SMTP Settings API
+  emailSettings: async (): Promise<EmailSettings> => {
+    const data = await request<{ settings: EmailSettings }>('/settings/email')
+    return data.settings
+  },
+
+  saveEmailSettings: (settings: Partial<EmailSettings>) =>
+    request<{ status: string; settings: EmailSettings }>('/settings/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    }),
+
+  testEmail: (recipient: string) =>
+    request<{ status: string; recipient: string }>('/settings/email/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recipient }),
+    }),
 }
 
 export { baseUrl }

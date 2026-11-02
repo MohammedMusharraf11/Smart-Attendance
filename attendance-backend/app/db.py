@@ -1,6 +1,10 @@
 """Vector DB wrapper (Chroma) for enrolled face embeddings."""
+from pathlib import Path
 import chromadb
 import numpy as np
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+CHROMA_PATH = str(BASE_DIR / "data" / "chroma_db")
 
 _client = None
 _collection = None
@@ -9,7 +13,7 @@ _collection = None
 def get_collection():
     global _client, _collection
     if _collection is None:
-        _client = chromadb.PersistentClient(path="./data/chroma_db")
+        _client = chromadb.PersistentClient(path=CHROMA_PATH)
         # cosine space so distances map directly to similarity (1 - distance)
         _collection = _client.get_or_create_collection(
             name="faces",

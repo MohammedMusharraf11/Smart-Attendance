@@ -11,15 +11,24 @@ import {
   type TriggerStatus,
   type LatestResult,
   type DeviceState,
+  type Teacher,
+  type ClassSession,
+  type SessionReport,
+  type EmailSettings,
 } from '@/lib/api'
 import {
   AlertCircle,
   ArrowRight,
+  BookOpen,
+  Calendar,
   Camera,
+  Check,
   CheckCircle2,
   ChevronRight,
   ClipboardList,
+  Clock,
   Cpu,
+  Download,
   Eye,
   FileCheck2,
   GraduationCap,
@@ -27,6 +36,7 @@ import {
   History as HistoryIcon,
   Info,
   LayoutDashboard,
+  Mail,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
@@ -36,11 +46,16 @@ import {
   RefreshCw,
   ScanLine,
   Search,
+  Send,
+  Settings,
+  ShieldCheck,
+  Sliders,
   Sparkles,
   Trash2,
   Upload,
   UserCheck,
   Users,
+  UserX,
   Video,
   VideoOff,
   X,
@@ -48,15 +63,34 @@ import {
   Zap,
 } from 'lucide-react'
 
-type Section = 'overview' | 'live-attendance' | 'enroll' | 'students' | 'tester' | 'history'
+import { ScheduleSection } from './components/ScheduleSection'
+import { ReportsSection } from './components/ReportsSection'
+import { TeachersSection } from './components/TeachersSection'
+import { SettingsSection } from './components/SettingsSection'
+
+type Section =
+  | 'overview'
+  | 'live-attendance'
+  | 'schedule'
+  | 'reports'
+  | 'teachers'
+  | 'enroll'
+  | 'students'
+  | 'history'
+  | 'settings'
+  | 'tester'
 
 const nav = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
-  { id: 'live-attendance', label: 'Live Attendance', icon: Radio },
+  { id: 'live-attendance', label: 'Live Kiosk', icon: Radio },
+  { id: 'schedule', label: 'Class Timetable', icon: Calendar },
+  { id: 'reports', label: 'Session Reports', icon: Mail },
+  { id: 'teachers', label: 'Faculty Directory', icon: BookOpen },
   { id: 'enroll', label: 'Student Enrollment', icon: UserCheck },
   { id: 'students', label: 'Enrolled Database', icon: Users },
-  { id: 'tester', label: 'Model & QR Tester', icon: Sparkles },
   { id: 'history', label: 'Logs & History', icon: ClipboardList },
+  { id: 'settings', label: 'Email Settings', icon: Settings },
+  { id: 'tester', label: 'Model & QR Tester', icon: Sparkles },
 ] as const
 
 function formatTime(val?: string) {
@@ -92,6 +126,7 @@ export default function SmartAttendanceDashboard() {
   const [loading, setLoading] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
+  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
   const [notice, setNotice] = useState<{ msg: string; type?: 'success' | 'error' | 'info' } | null>(null)
 
   const showToast = (msg: string, type: 'success' | 'error' | 'info' = 'info') => {
@@ -310,6 +345,32 @@ export default function SmartAttendanceDashboard() {
               onError={(err) => showToast(err, 'error')}
               onSuccess={(msg) => showToast(msg, 'success')}
             />
+          )}
+
+          {section === 'schedule' && (
+            <ScheduleSection
+              onViewReport={(id) => {
+                setSelectedSessionId(id)
+                setSection('reports')
+              }}
+              onShowToast={showToast}
+            />
+          )}
+
+          {section === 'reports' && (
+            <ReportsSection
+              initialSessionId={selectedSessionId}
+              onScheduleClick={() => setSection('schedule')}
+              onShowToast={showToast}
+            />
+          )}
+
+          {section === 'teachers' && (
+            <TeachersSection onShowToast={showToast} />
+          )}
+
+          {section === 'settings' && (
+            <SettingsSection onShowToast={showToast} />
           )}
 
           {section === 'history' && <HistorySection records={records} />}
@@ -1411,8 +1472,59 @@ function LiveAttendanceSection({
   onError: (msg: string) => void
   onSuccess?: (msg: string) => void
 }) {
+  const [activeClass, setActiveClass] = useState<ClassSession | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+    const checkActive = async () => {
+      try {
+        const sess = await api.activeSession()
+        if (mounted) setActiveClass(sess)
+      } catch {}
+    }
+    checkActive()
+    const timer = setInterval(checkActive, 8000)
+    return () => {
+      mounted = false
+      clearInterval(timer)
+    }
+  }, [])
+
   return (
     <div className="space-y-6">
+      {/* Active Scheduled Class Banner */}
+      {activeClass && (
+        <div className="rounded-2xl border border-sky-500/40 bg-sky-500/10 p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-sm animate-in fade-in">
+          <div className="flex items-center gap-3">
+            <span className="flex size-3 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-sky-400 bg-sky-950/80 px-2 py-0.5 rounded border border-sky-500/30">
+                  Active Lecture
+                </span>
+                <span className="text-sm font-bold text-foreground">{activeClass.subject_name}</span>
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Faculty: <strong className="text-foreground">{activeClass.teacher_name}</strong> ({activeClass.teacher_email}) &bull; Scheduled: {activeClass.start_time} - {activeClass.end_time}
+              </p>
+            </div>
+          </div>
+          <div className="text-xs shrink-0 flex items-center gap-2">
+            {activeClass.is_within_cutoff ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                <Clock className="size-3.5" />
+                Cutoff: till {activeClass.cutoff_time} ({activeClass.cutoff_minutes}m window)
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                <Clock className="size-3.5" />
+                Cutoff Closed ({activeClass.cutoff_time})
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Top Banner Explainer */}
       <div className="rounded-2xl border border-primary/20 bg-primary/5 p-4 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
