@@ -311,6 +311,7 @@ export default function SmartAttendanceDashboard() {
 
           {section === 'enroll' && (
             <EnrollmentSection
+              existingStudents={students}
               onSuccess={(msg) => {
                 showToast(msg, 'success')
                 syncData()
@@ -323,6 +324,8 @@ export default function SmartAttendanceDashboard() {
             <StudentsSection
               students={students}
               onRefresh={syncData}
+              onSuccess={(msg) => showToast(msg, 'success')}
+              onError={(err) => showToast(err, 'error')}
               onDelete={async (code) => {
                 try {
                   await api.deleteStudent(code)
@@ -1613,15 +1616,23 @@ function LiveAttendanceSection({
 function EnrollmentSection({
   onSuccess,
   onError,
+  existingStudents = [],
 }: {
   onSuccess: (msg: string) => void
   onError: (msg: string) => void
+  existingStudents?: Student[]
 }) {
   const [name, setName] = useState('')
   const [code, setCode] = useState('')
   const [enrolling, setEnrolling] = useState(false)
   const [images, setImages] = useState<{ file: File; preview: string }[]>([])
   const [cameraActive, setCameraActive] = useState(false)
+
+  const matchedStudent = useMemo(() => {
+    const trimmed = code.trim().toUpperCase()
+    if (!trimmed) return null
+    return existingStudents.find((s) => s.code.toUpperCase() === trimmed) || null
+  }, [code, existingStudents])
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -1750,10 +1761,26 @@ function EnrollmentSection({
                 type="text"
                 value={code}
                 onChange={(e) => setCode(e.target.value.toUpperCase())}
-                placeholder="e.g. CS-101 or 2024-ECE-042"
+                placeholder="e.g. CS-101 or 1RL23EC043"
                 className="w-full rounded-xl border border-input bg-background px-3.5 py-2.5 text-sm font-mono uppercase outline-none focus:ring-2 focus:ring-primary"
                 required
               />
+              {matchedStudent && (
+                <div className="mt-2 rounded-xl border border-primary/20 bg-primary/5 p-2.5 text-xs flex items-center justify-between">
+                  <span className="text-primary font-medium">
+                    Existing student found: <b>{matchedStudent.name}</b> ({matchedStudent.image_count} vectors saved)
+                  </span>
+                  {!name && (
+                    <button
+                      type="button"
+                      onClick={() => setName(matchedStudent.name)}
+                      className="text-xs font-semibold text-primary underline ml-2"
+                    >
+                      Use Name
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1839,6 +1866,10 @@ function EnrollmentSection({
               <>
                 <RefreshCw className="size-4 animate-spin" /> Enrolling Face Vectors in ChromaDB...
               </>
+            ) : matchedStudent ? (
+              <>
+                <UserCheck className="size-4" /> Add {images.length} Face Vector{images.length === 1 ? '' : 's'} to {matchedStudent.name}
+              </>
             ) : (
               <>
                 <UserCheck className="size-4" /> Enroll Student ({images.length} images)
@@ -1852,6 +1883,273 @@ function EnrollmentSection({
 }
 
 /* =========================================================================
+   3.5 ADD FACE VECTORS MODAL (Direct from Student Registry)
+   ========================================================================= */
+function AddFaceModal({
+  student,
+  onClose,
+  onSuccess,
+  onError,
+}: {
+  student: Student
+  onClose: () => void
+  onSuccess: (msg: string) => void
+  onError: (msg: string) => void
+}) {
+  const [images, setImages] = useState<{ file: File; preview: string }[]>([])
+  const [uploading, setUploading] = useState(false)
+  const [progressMsg, setProgressMsg] = useState('')
+  const [cameraActive, setCameraActive] = useState(false)
+
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      })
+      streamRef.current = stream
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+      }
+      setCameraActive(true)
+    } catch (err: any) {
+      onError('Unable to open camera: ' + (err.message || String(err)))
+    }
+  }
+
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop())
+      streamRef.current = null
+    }
+    if (videoRef.current) videoRef.current.srcObject = null
+    setCameraActive(false)
+  }
+
+  useEffect(() => {
+    return () => {
+      stopCamera()
+    }
+  }, [])
+
+  const capturePhoto = () => {
+    if (!videoRef.current) return
+    const video = videoRef.current
+    const canvas = document.createElement('canvas')
+    canvas.width = video.videoWidth || 640
+    canvas.height = video.videoHeight || 480
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    canvas.toBlob((blob) => {
+      if (blob) {
+        const file = new File([blob], `snap_${student.code}_${Date.now()}.jpg`, { type: 'image/jpeg' })
+        setImages((prev) => [...prev, { file, preview: URL.createObjectURL(blob) }])
+      }
+    }, 'image/jpeg', 0.95)
+  }
+
+  const handleFilePick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    const newImgs = files.map((f) => ({ file: f, preview: URL.createObjectURL(f) }))
+    setImages((prev) => [...prev, ...newImgs])
+  }
+
+  const removeImage = (index: number) => {
+    setImages((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  const handleSave = async () => {
+    if (images.length === 0) {
+      onError('Please snap or upload at least 1 photo to add.')
+      return
+    }
+
+    setUploading(true)
+    let addedCount = 0
+    const errors: string[] = []
+
+    for (let i = 0; i < images.length; i++) {
+      setProgressMsg(`Processing photo ${i + 1} of ${images.length}...`)
+      try {
+        await api.enroll(student.name, student.code, images[i].file)
+        addedCount++
+      } catch (err: any) {
+        errors.push(`Photo #${i + 1}: ${err.message || 'Face detection failed'}`)
+      }
+    }
+
+    setUploading(false)
+    setProgressMsg('')
+
+    if (addedCount > 0) {
+      stopCamera()
+      onSuccess(`Successfully added ${addedCount} face vector(s) for ${student.name} (${student.code}). Total now: ${student.image_count + addedCount}`)
+    }
+    if (errors.length > 0) {
+      onError(`Failed for some images: ${errors.join('; ')}`)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+      <div className="bg-card border border-border rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-5 my-8">
+        {/* Header */}
+        <div className="flex items-start justify-between">
+          <div>
+            <h3 className="text-lg font-bold flex items-center gap-2">
+              <Camera className="size-5 text-primary" />
+              Add Face Vectors
+            </h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Append additional facial angles or lighting conditions to boost recognition accuracy.
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              stopCamera()
+              onClose()
+            }}
+            className="p-1.5 rounded-lg text-muted-foreground hover:bg-muted"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
+
+        {/* Student Target Banner */}
+        <div className="flex items-center justify-between rounded-xl border border-border bg-muted/40 p-3.5">
+          <div className="flex items-center gap-3">
+            <div className="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary font-bold text-sm">
+              {getInitials(student.name)}
+            </div>
+            <div>
+              <p className="text-sm font-semibold">{student.name}</p>
+              <p className="text-xs font-mono text-muted-foreground">{student.code}</p>
+            </div>
+          </div>
+          <span className="text-xs font-medium bg-background border border-border px-3 py-1 rounded-full text-foreground shadow-xs">
+            {student.image_count} existing vectors
+          </span>
+        </div>
+
+        {/* Action Toolbar */}
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Capture or Upload
+            </span>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={cameraActive ? stopCamera : startCamera}
+                className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-semibold hover:bg-muted"
+              >
+                {cameraActive ? 'Close Camera' : 'Open Camera'}
+              </button>
+              <label className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-semibold hover:bg-muted cursor-pointer inline-flex items-center gap-1.5">
+                <Upload className="size-3" /> Upload Files
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  className="hidden"
+                  onChange={handleFilePick}
+                />
+              </label>
+            </div>
+          </div>
+
+          {/* Camera Stream */}
+          {cameraActive && (
+            <div className="rounded-xl border border-border bg-black/60 p-3 flex flex-col items-center gap-3">
+              <div className="relative aspect-video w-full rounded-lg bg-black overflow-hidden border border-border/50">
+                <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover mirror" />
+              </div>
+              <button
+                type="button"
+                onClick={capturePhoto}
+                className="rounded-xl bg-primary text-primary-foreground px-4 py-2 text-xs font-semibold shadow hover:bg-primary/90 flex items-center gap-2"
+              >
+                <Camera className="size-4" /> Snap Photo
+              </button>
+            </div>
+          )}
+
+          {/* Pending Photos List */}
+          {images.length > 0 ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <span>New Photos to Add ({images.length})</span>
+                <button
+                  type="button"
+                  onClick={() => setImages([])}
+                  className="text-xs text-rose-500 hover:underline"
+                >
+                  Clear all
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-2.5 max-h-40 overflow-y-auto p-2 border border-border/50 rounded-xl bg-muted/20">
+                {images.map((img, i) => (
+                  <div key={i} className="relative size-16 rounded-lg border border-border overflow-hidden group">
+                    <img src={img.preview} alt={`new-${i}`} className="size-full object-cover" />
+                    <button
+                      type="button"
+                      onClick={() => removeImage(i)}
+                      className="absolute top-1 right-1 size-5 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-xl border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+              No new photos selected yet. Open camera to snap shots or click Upload Files.
+            </div>
+          )}
+        </div>
+
+        {/* Footer Buttons */}
+        <div className="flex items-center justify-end gap-2 pt-3 border-t border-border">
+          <button
+            type="button"
+            onClick={() => {
+              stopCamera()
+              onClose()
+            }}
+            disabled={uploading}
+            className="px-4 py-2 text-xs font-semibold rounded-xl border border-border hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={uploading || images.length === 0}
+            className="px-4 py-2 text-xs font-semibold rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 flex items-center gap-2 shadow"
+          >
+            {uploading ? (
+              <>
+                <RefreshCw className="size-3.5 animate-spin" />
+                <span>{progressMsg || 'Saving Vectors...'}</span>
+              </>
+            ) : (
+              <>
+                <UserCheck className="size-3.5" />
+                <span>Save {images.length > 0 ? `${images.length} Face Vector${images.length > 1 ? 's' : ''}` : 'Vectors'}</span>
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* =========================================================================
    4. STUDENTS DIRECTORY
    ========================================================================= */
 function StudentsSection({
@@ -1859,13 +2157,19 @@ function StudentsSection({
   onRefresh,
   onDelete,
   onEnrollClick,
+  onSuccess,
+  onError,
 }: {
   students: Student[]
   onRefresh: () => void
   onDelete: (code: string) => void
   onEnrollClick: () => void
+  onSuccess?: (msg: string) => void
+  onError?: (err: string) => void
 }) {
   const [query, setQuery] = useState('')
+  const [targetStudentForAdd, setTargetStudentForAdd] = useState<Student | null>(null)
+
   const filtered = useMemo(
     () =>
       students.filter(
@@ -1878,6 +2182,21 @@ function StudentsSection({
 
   return (
     <div className="space-y-6">
+      {targetStudentForAdd && (
+        <AddFaceModal
+          student={targetStudentForAdd}
+          onClose={() => setTargetStudentForAdd(null)}
+          onSuccess={(msg) => {
+            setTargetStudentForAdd(null)
+            onRefresh()
+            onSuccess?.(msg)
+          }}
+          onError={(err) => {
+            onError?.(err)
+          }}
+        />
+      )}
+
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-lg font-bold">Enrolled Student Registry</h2>
@@ -1926,10 +2245,20 @@ function StudentsSection({
                   </div>
                 </div>
 
-                <div className="flex items-center gap-4">
-                  <span className="text-xs font-medium bg-muted px-2.5 py-1 rounded-full text-muted-foreground">
+                <div className="flex items-center gap-2.5 sm:gap-3">
+                  <span className="text-xs font-medium bg-muted px-2.5 py-1 rounded-full text-muted-foreground whitespace-nowrap">
                     {s.image_count} face vector{s.image_count === 1 ? '' : 's'}
                   </span>
+
+                  <button
+                    onClick={() => setTargetStudentForAdd(s)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-primary/30 bg-primary/10 text-primary hover:bg-primary/20 text-xs font-semibold transition-colors shadow-xs"
+                    title={`Add more face vectors for ${s.name}`}
+                  >
+                    <Camera className="size-3.5" />
+                    <span>+ Add Photos</span>
+                  </button>
+
                   <button
                     onClick={() => {
                       if (confirm(`Are you sure you want to delete ${s.name} (${s.code}) and all associated face embeddings?`)) {
